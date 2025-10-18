@@ -1,0 +1,7 @@
+streamlit==1.36.0
+requests==2.31.0
+bs4==4.12.2
+pandas==2.1.4
+scikit-learn==1.4.2
+lxml==5.1.1
+numpy==1.26.4

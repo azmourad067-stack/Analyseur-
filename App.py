@@ -1,7 +1,6 @@
 import streamlit as st
 import requests
-import bs4
-BeautifulSoup = bs4.BeautifulSoup
+from beautifulsoup4 import BeautifulSoup
 import pandas as pd
 import numpy as np
 import json

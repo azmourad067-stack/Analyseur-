@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
+import re
 import pandas as pd
 import numpy as np
 import json
@@ -96,8 +97,12 @@ def scrape_geny_partants_by_corde(url):
             
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Extraire les données de la table
-        table = soup.find('table')
+        # Trouver la table des partants
+        table = soup.find('table', class_='table-partants')
+        if not table:
+            # Essaye avec un sélecteur plus générique
+            table = soup.find('table')
+        
         if not table:
             st.error("❌ Aucun tableau trouvé")
             return None
@@ -107,24 +112,37 @@ def scrape_geny_partants_by_corde(url):
         
         for row in rows:
             cols = row.find_all('td')
-            if len(cols) < 10:
+            if len(cols) < 8:
                 continue
                 
             try:
-                num_cheval = safe_int_convert(cols[0].get_text().strip())  # N° du cheval
-                nom = nettoyer_donnees(cols[1].get_text())
-                corde = safe_int_convert(cols[2].get_text().strip())  # Position à la corde (C)
+                # Numéro du cheval
+                num_cheval_elem = cols[0].find('a') or cols[0]
+                num_cheval = safe_int_convert(num_cheval_elem.get_text().strip())
                 
-                # Poids : si vide, mettre 58.0
-                poids_str = cols[3].get_text().strip()
+                # Nom
+                nom_elem = cols[1].find('a') or cols[1]
+                nom = nettoyer_donnees(nom_elem.get_text())
+                
+                # Position à la corde (C)
+                corde_elem = cols[2].find('span') or cols[2]
+                corde = safe_int_convert(corde_elem.get_text().strip()) if corde_elem else None
+                
+                # Poids
+                poids_str = cols[3].get_text().strip() if len(cols) > 3 else ""
                 poids = extract_weight_kg(poids_str) if poids_str else 58.0
                 
-                musique = nettoyer_donnees(cols[5].get_text())
-                jockey = nettoyer_donnees(cols[6].get_text())
-                entraineur = nettoyer_donnees(cols[7].get_text())
+                # Musique
+                musique = nettoyer_donnees(cols[5].get_text()) if len(cols) > 5 else ""
                 
-                # Cote : si vide, mettre 15.0
-                cote_str = cols[9].get_text().strip()
+                # Jockey
+                jockey = nettoyer_donnees(cols[6].get_text()) if len(cols) > 6 else ""
+                
+                # Entraîneur
+                entraineur = nettoyer_donnees(cols[7].get_text()) if len(cols) > 7 else ""
+                
+                # Cote
+                cote_str = cols[-1].get_text().strip() if len(cols) > 0 else ""
                 cote = safe_float_convert(cote_str) if cote_str else 15.0
                 
                 # Valider la corde

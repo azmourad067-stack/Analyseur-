@@ -1,7 +1,10 @@
 streamlit
+pandas
+numpy
 requests
 beautifulsoup4
-pandas
-scikit-learn
 lxml
-numpy
+plotly
+scikit-learn
+tensorflow
+keras

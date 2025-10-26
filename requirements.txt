@@ -1,10 +1,42 @@
-streamlit
-pandas
-numpy
-requests
-beautifulsoup4
-lxml
-plotly
-scikit-learn
-tensorflow
-keras
+# ============================================================================
+# Requirements.txt - Analyseur Hippique ML v2.0
+# ============================================================================
+# Installation: pip install -r requirements.txt
+# ============================================================================
+
+# === FRAMEWORK WEB ===
+streamlit>=1.28.0
+
+# === DATA MANIPULATION ===
+pandas>=2.0.0
+numpy>=1.24.0
+
+# === MACHINE LEARNING ===
+scikit-learn>=1.3.0
+
+# === WEB SCRAPING ===
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# === VISUALISATION ===
+plotly>=5.17.0
+kaleido>=0.2.1
+
+# === UTILITAIRES ===
+python-dateutil>=2.8.2
+
+# ============================================================================
+# NOTES DE DÉPLOIEMENT
+# ============================================================================
+#
+# Pour Streamlit Cloud :
+# - Ce fichier doit être à la racine du projet
+# - Python 3.9+ recommandé
+# - Les versions >= permettent la compatibilité future
+#
+# Pour installation locale rapide :
+# pip install streamlit pandas numpy scikit-learn plotly beautifulsoup4 requests
+#
+# Taille approximative: ~150 MB
+# ============================================================================

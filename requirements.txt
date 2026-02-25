@@ -1,5 +1,8 @@
-streamlit==1.36.0
-pandas==2.1.4
-plotly==5.18.0
-numpy==1.26.3
-Pillow==10.1.0
+streamlit
+pandas
+numpy
+easyocr
+opencv-python-headless
+Pillow
+matplotlib
+scikit-learn

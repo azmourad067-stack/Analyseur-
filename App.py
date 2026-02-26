@@ -1,37 +1,3 @@
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║          🏇  PronoHippique AI  —  Script complet unique          ║
-...
-    Le jeu peut créer une dépendance. Jouez de manière responsable.</em><br>
-    <small>Joueurs Info Service : <strong>09 74 75 13 13</strong></small>
-</div>
-""", unsafe_allow_html=True)
-Tool Call
-Function Name:
-Write
-Arguments:
-file_path:
-/home/user/single_app/app.py
-content:
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║          🏇  PronoHippique AI  —  Script complet unique          ║
-║     Application Streamlit de pronostics hippiques intelligente   ║
-║         Déployable directement sur Streamlit Cloud               ║
-╚══════════════════════════════════════════════════════════════════╝
-
-Tous les modules sont intégrés dans ce fichier unique :
-  → OCR Extractor   : extraction Gemini / OpenAI / EasyOCR
-  → Data Cleaner    : nettoyage & parsing des données
-  → Scorer          : algorithme de scoring multi-critères
-  → Pronostic       : génération Trio / Quinté / classement
-  → Visualizer      : graphiques Plotly interactifs
-  → App             : interface Streamlit complète
-"""
-
-# ══════════════════════════════════════════════════════════════════
-#  IMPORTS
-# ══════════════════════════════════════════════════════════════════
 import streamlit as st
 import pandas as pd
 import numpy as np

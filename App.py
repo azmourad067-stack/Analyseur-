@@ -174,101 +174,187 @@ def extract_with_openai(image: Image.Image, api_key: str) -> dict:
         return {"error": str(e), "ocr_engine": "OpenAI GPT-4o"}
 
 
+def _is_musique_token(p: str) -> bool:
+    """Vérifie si un token ressemble à une musique hippique."""
+    SA_RE_   = re.compile(r"^[A-Za-z]{1,2}\d{1,2}$")
+    DIST_RE_ = re.compile(r"^\d{4}$")
+    if SA_RE_.match(p) or DIST_RE_.match(p):
+        return False
+    return bool(re.search(r"\(\d+\)|[DdMmAa]", p) and re.search(r"\d", p) and len(p) >= 3)
+
+
+def _is_person_name_token(p: str) -> bool:
+    """Vérifie si un token est un nom de personne (Driver/Entraîneur)."""
+    SA_RE_   = re.compile(r"^[A-Za-z]{1,2}\d{1,2}$")
+    DIST_RE_ = re.compile(r"^\d{4}$")
+    if len(p) < 3 or SA_RE_.match(p) or DIST_RE_.match(p):
+        return False
+    if _is_musique_token(p):
+        return False
+    if re.match(r"^\d", p):
+        return False
+    if p.strip().lower() in ("non-partant", "non partant", "partant", "absent", "np",
+                              "capture", "d\'écran", "png", "jpg"):
+        return False
+    # "A. Muidebled", "Ch. Martens", "J.-C. Sorel", "N. G. Lefèvre"
+    if re.match(r"^[A-ZÀ-Ü][a-zA-ZÀ-Ü]{0,2}[.\-]", p):  # initiale avec casse mixte ex "Ch."
+        return True
+    # "Pacha", "Alexandre", "Sassier"
+    if re.match(r"^[A-ZÀ-Ü][a-zà-ü]{2,}", p):
+        return True
+    return False
+
+
+def _smart_tokenize_ocr_line(line: str) -> list:
+    """
+    Tokenise une ligne brute OCR en tokens sémantiques.
+    Gère les deux formats : avec pipes (|) et sans pipes (tokens bruts).
+    Fusionne automatiquement :
+      - les gains "173 060" → "173060"
+      - les noms avec initiale "Ch. Martens", "J.-C. Sorel"
+      - les noms multi-mots "Kompany Vincent", "Give Me Cash", "Joy du Carnois"
+    """
+    line = re.sub(r"\s+", " ", line.strip())
+    # Format pipe : délimitation déjà faite
+    if "|" in line:
+        return [p.strip() for p in line.split("|") if p.strip()]
+
+    SA_RE_   = re.compile(r"^[A-Za-z]{1,2}\d{1,2}$")
+    DIST_RE_ = re.compile(r"^\d{4}$")
+
+    def _is_cap(w):
+        return bool(re.match(r"^[A-ZÀ-Ü][a-zà-ü]", w))
+
+    LINKING = {"du", "de", "des", "le", "la", "les", "au", "aux", "d'"}
+
+    words  = line.split(" ")
+    tokens = []
+    i = 0
+    while i < len(words):
+        w    = words[i]
+        nxt  = words[i+1] if i+1 < len(words) else ""
+        nxt2 = words[i+2] if i+2 < len(words) else ""
+
+        # Gains "173 060" (deux groupes de 3 chiffres)
+        if re.match(r"^\d{3}$", w) and re.match(r"^\d{3}$", nxt):
+            tokens.append(w + nxt); i += 2; continue
+
+        # Initiale triple "N. G. Lefèvre"
+        if re.match(r"^[A-Z]\.$", w) and re.match(r"^[A-Z]\.$", nxt) and nxt2:
+            tokens.append(w + " " + nxt + " " + nxt2); i += 3; continue
+
+        # Initiale composée "J.-C. Sorel"
+        if re.match(r"^[A-ZÀ-Ü]\.-[A-ZÀ-Ü]\.$", w) and nxt and not re.match(r"^\d", nxt):
+            tokens.append(w + " " + nxt); i += 2; continue
+
+        # Initiale simple "A. Nom", "Ch. Nom"
+        if re.match(r"^[A-ZÀ-Ü][a-zA-ZÀ-Ü]{0,2}\.$", w) and nxt and not re.match(r"^\d", nxt):
+            tokens.append(w + " " + nxt); i += 2; continue
+
+        # Nom de cheval multi-mots : "Kompany Vincent", "Give Me Cash", "Héros des Mottes"
+        if (_is_cap(w) and not SA_RE_.match(w) and not DIST_RE_.match(w)
+                and not _is_musique_token(w)):
+            parts = [w]
+            j = i + 1
+            while j < len(words):
+                nw = words[j]
+                if SA_RE_.match(nw) or DIST_RE_.match(nw) or _is_musique_token(nw): break
+                if re.match(r"^\d", nw): break
+                if not (_is_cap(nw) or nw.lower() in LINKING): break
+                parts.append(nw)
+                j += 1
+            if len(parts) >= 2:
+                tokens.append(" ".join(parts)); i = j; continue
+
+        tokens.append(w); i += 1
+    return tokens
+
+
+def _parse_horse_from_tokens(toks: list) -> dict | None:
+    """
+    Extrait les données d'un cheval depuis une liste de tokens sémantiques.
+    Retourne None si la ligne ne correspond pas à un partant valide.
+    """
+    if not toks:
+        return None
+    SA_RE_   = re.compile(r"^[A-Za-z]{1,2}\d{1,2}$")
+    DIST_RE_ = re.compile(r"^\d{4}$")
+
+    # Token 0 = numéro de partant
+    num_match = re.match(r"^(\d{1,2})\b", toks[0])
+    if not num_match:
+        return None
+    numero = int(num_match.group(1))
+    if not (1 <= numero <= 20):
+        return None
+
+    horse = {"numero": numero}
+
+    # Token 1 = nom du cheval
+    if len(toks) > 1 and len(toks[1]) >= 2:
+        horse["cheval"] = toks[1]
+
+    # SA (sexe+âge) : premier token correspondant au pattern
+    for t in toks[2:7]:
+        if SA_RE_.match(t):
+            horse["sa"] = t; break
+
+    # Distance : premier token de 4 chiffres
+    for t in toks[2:8]:
+        if DIST_RE_.match(t):
+            horse["dist"] = int(t); break
+
+    # Musique
+    for t in toks:
+        if _is_musique_token(t):
+            horse["musique"] = t; break
+
+    # Driver & Entraîneur
+    names = [t for t in toks[2:] if _is_person_name_token(t)]
+    if names:
+        horse["driver"]      = names[0]
+    if len(names) >= 2:
+        horse["entraineur"]  = names[1]
+
+    # Non-partant
+    if any(t.lower() in ("non-partant", "non partant") for t in toks):
+        horse["non_partant"] = True
+
+    # Gains (5-7 chiffres consécutifs)
+    for t in toks:
+        c = re.sub(r"\s", "", t)
+        if re.match(r"^\d{5,7}$", c):
+            horse["gains"] = float(c); break
+
+    # Cote PMU : dernière valeur numérique entre 1.0 et 150 (évite dist, gains)
+    for t in reversed(toks):
+        if t in ("-", "—", ""):
+            continue
+        cs = t.replace(",", ".")
+        m = re.match(r"^(\d{1,3}(?:\.\d)?)$", cs)
+        if m:
+            v = float(m.group(1))
+            if 1.0 <= v <= 150.0:
+                horse["cote_pmu"] = v; break
+
+    return horse if horse.get("cheval") else None
+
+
 def _parse_easyocr_lines_to_chevaux(lines: list) -> list:
     """
-    Tente de parser les lignes brutes EasyOCR en liste de chevaux structurés.
-    Format attendu par ligne (séparé par |) :
-      N° | Cheval | SA | Dist | Driver | Entraineur | Musique | Gains | [Ecart] | Cote
-    Colonnes optionnelles tolérées (6 champs minimum pour tenter le parse).
+    Parse les lignes brutes EasyOCR en liste de chevaux structurés.
+    Supporte les formats avec et sans séparateur |.
+    Bucket Y réduit (12px) pour éviter la fusion de lignes adjacentes.
     """
-    MUSIQUE_RE = re.compile(r"^[\dDdMmAa()\s]+$")  # caractères typiques d'une musique
-    SA_RE      = re.compile(r"^[A-Za-z]{1,2}\d{1,2}$")  # ex: M6, H10, F8
-    DIST_RE    = re.compile(r"^\d{4}$")              # ex: 2950
-
     chevaux = []
+    seen_nums = set()
     for raw_line in lines:
-        # Nettoyage séparateurs multiples
-        line = re.sub(r"\s*\|\s*", " | ", raw_line.strip())
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 6:
-            continue
-
-        # Détection robuste du numéro en première colonne
-        num_match = re.match(r"^(\d{1,2})\b", parts[0])
-        if not num_match:
-            continue
-        numero = int(num_match.group(1))
-        if numero < 1 or numero > 20:
-            continue  # Hors plage attendue
-
-        horse = {"numero": numero}
-
-        # Cheval : 2ème colonne — texte avec majuscule(s) et longueur raisonnable
-        nom = parts[1] if len(parts) > 1 else ""
-        if len(nom) >= 2:
-            horse["cheval"] = nom
-
-        # SA (sexe+âge) : ex M6, H10, F8
-        for i in range(2, min(5, len(parts))):
-            if SA_RE.match(parts[i]):
-                horse["sa"] = parts[i]
-                break
-
-        # Distance : 4 chiffres consécutifs
-        for i in range(2, min(6, len(parts))):
-            if DIST_RE.match(parts[i]):
-                horse["dist"] = int(parts[i])
-                break
-
-        # Driver & Entraîneur : détection de noms de personnes
-        # Gère: "A. Muidebled", "N. G. Lefèvre", "N. Pacha", "J.-C. Sorel"
-        def _is_person_name(p):
-            if len(p) < 3 or SA_RE.match(p) or DIST_RE.match(p):
-                return False
-            if re.search(r"\(\d+\)|[DdMmAa]", p) and re.search(r"\d", p):
-                return False  # ressemble à une musique
-            if re.match(r"^\d", p):
-                return False  # commence par un chiffre
-            if re.match(r"^[A-ZÀ-Ü][a-zA-ZÀ-Ü]?[.\-]", p):   # Initiale: "A. Nom"
-                return True
-            if re.match(r"^[A-ZÀ-Ü][a-zà-ü]{2,}", p):          # Capitalisé: "Pacha"
-                return True
-            return False
-        name_cols = [p for p in parts[2:] if _is_person_name(p)]
-        if len(name_cols) >= 1:
-            horse["driver"]     = name_cols[0]
-        if len(name_cols) >= 2:
-            horse["entraineur"] = name_cols[1]
-
-        # Musique : colonne contenant des chiffres + lettres D/m/a + éventuellement (25)
-        for p in parts:
-            if re.search(r"\(\d+\)|[DdMmAa]", p) and re.search(r"\d", p) and len(p) >= 3:
-                horse["musique"] = p
-                break
-
-        # Gains : séquence de chiffres avec espace (ex: "241 390" → 241390)
-        for p in parts:
-            clean = re.sub(r"\s", "", p)
-            if re.match(r"^\d{5,7}$", clean):
-                horse["gains"] = float(clean)
-                break
-
-        # Cote PMU : dernière valeur numérique décimale (virgule ou point)
-        for p in reversed(parts):
-            cote_str = p.replace(",", ".")
-            m = re.match(r"^(\d{1,3}\.\d)$", cote_str)
-            if m:
-                try:
-                    horse["cote_pmu"] = float(m.group(1))
-                    break
-                except ValueError:
-                    pass
-
-        # Garder uniquement si on a au moins le nom et le numéro
-        if horse.get("cheval"):
-            chevaux.append(horse)
-
-    return chevaux
+        toks = _smart_tokenize_ocr_line(raw_line)
+        h    = _parse_horse_from_tokens(toks)
+        if h and h["numero"] not in seen_nums:
+            seen_nums.add(h["numero"])
+            chevaux.append(h)
+    return sorted(chevaux, key=lambda x: x["numero"])
 
 
 def extract_with_easyocr(image: Image.Image) -> dict:
@@ -291,7 +377,7 @@ def extract_with_easyocr(image: Image.Image) -> dict:
             if conf < 0.25:          # seuil légèrement abaissé pour capter plus
                 continue
             y_center = int((bbox[0][1] + bbox[2][1]) / 2)
-            y_bucket = (y_center // 18) * 18   # bucket plus fin = meilleur alignement
+            y_bucket = (y_center // 12) * 12   # bucket 12px = meilleure séparation des lignes
             lines_by_y.setdefault(y_bucket, []).append((bbox[0][0], text.strip()))
 
         lines = []

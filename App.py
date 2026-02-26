@@ -159,7 +159,7 @@ def extract_with_easyocr(image: Image.Image) -> dict:
     """Extraction via EasyOCR (fallback local, précision réduite)."""
     try:
         import easyocr
-        import numpy as np as np_local
+        import numpy as np
         reader = easyocr.Reader(["fr", "en"], gpu=False, verbose=False)
         img_array = np_local.array(image)
         results = reader.readtext(img_array, detail=1)

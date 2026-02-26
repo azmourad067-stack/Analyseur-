@@ -174,34 +174,144 @@ def extract_with_openai(image: Image.Image, api_key: str) -> dict:
         return {"error": str(e), "ocr_engine": "OpenAI GPT-4o"}
 
 
+def _parse_easyocr_lines_to_chevaux(lines: list) -> list:
+    """
+    Tente de parser les lignes brutes EasyOCR en liste de chevaux structurés.
+    Format attendu par ligne (séparé par |) :
+      N° | Cheval | SA | Dist | Driver | Entraineur | Musique | Gains | [Ecart] | Cote
+    Colonnes optionnelles tolérées (6 champs minimum pour tenter le parse).
+    """
+    MUSIQUE_RE = re.compile(r"^[\dDdMmAa()\s]+$")  # caractères typiques d'une musique
+    SA_RE      = re.compile(r"^[A-Za-z]{1,2}\d{1,2}$")  # ex: M6, H10, F8
+    DIST_RE    = re.compile(r"^\d{4}$")              # ex: 2950
+
+    chevaux = []
+    for raw_line in lines:
+        # Nettoyage séparateurs multiples
+        line = re.sub(r"\s*\|\s*", " | ", raw_line.strip())
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 6:
+            continue
+
+        # Détection robuste du numéro en première colonne
+        num_match = re.match(r"^(\d{1,2})\b", parts[0])
+        if not num_match:
+            continue
+        numero = int(num_match.group(1))
+        if numero < 1 or numero > 20:
+            continue  # Hors plage attendue
+
+        horse = {"numero": numero}
+
+        # Cheval : 2ème colonne — texte avec majuscule(s) et longueur raisonnable
+        nom = parts[1] if len(parts) > 1 else ""
+        if len(nom) >= 2:
+            horse["cheval"] = nom
+
+        # SA (sexe+âge) : ex M6, H10, F8
+        for i in range(2, min(5, len(parts))):
+            if SA_RE.match(parts[i]):
+                horse["sa"] = parts[i]
+                break
+
+        # Distance : 4 chiffres consécutifs
+        for i in range(2, min(6, len(parts))):
+            if DIST_RE.match(parts[i]):
+                horse["dist"] = int(parts[i])
+                break
+
+        # Driver & Entraîneur : détection de noms de personnes
+        # Gère: "A. Muidebled", "N. G. Lefèvre", "N. Pacha", "J.-C. Sorel"
+        def _is_person_name(p):
+            if len(p) < 3 or SA_RE.match(p) or DIST_RE.match(p):
+                return False
+            if re.search(r"\(\d+\)|[DdMmAa]", p) and re.search(r"\d", p):
+                return False  # ressemble à une musique
+            if re.match(r"^\d", p):
+                return False  # commence par un chiffre
+            if re.match(r"^[A-ZÀ-Ü][a-zA-ZÀ-Ü]?[.\-]", p):   # Initiale: "A. Nom"
+                return True
+            if re.match(r"^[A-ZÀ-Ü][a-zà-ü]{2,}", p):          # Capitalisé: "Pacha"
+                return True
+            return False
+        name_cols = [p for p in parts[2:] if _is_person_name(p)]
+        if len(name_cols) >= 1:
+            horse["driver"]     = name_cols[0]
+        if len(name_cols) >= 2:
+            horse["entraineur"] = name_cols[1]
+
+        # Musique : colonne contenant des chiffres + lettres D/m/a + éventuellement (25)
+        for p in parts:
+            if re.search(r"\(\d+\)|[DdMmAa]", p) and re.search(r"\d", p) and len(p) >= 3:
+                horse["musique"] = p
+                break
+
+        # Gains : séquence de chiffres avec espace (ex: "241 390" → 241390)
+        for p in parts:
+            clean = re.sub(r"\s", "", p)
+            if re.match(r"^\d{5,7}$", clean):
+                horse["gains"] = float(clean)
+                break
+
+        # Cote PMU : dernière valeur numérique décimale (virgule ou point)
+        for p in reversed(parts):
+            cote_str = p.replace(",", ".")
+            m = re.match(r"^(\d{1,3}\.\d)$", cote_str)
+            if m:
+                try:
+                    horse["cote_pmu"] = float(m.group(1))
+                    break
+                except ValueError:
+                    pass
+
+        # Garder uniquement si on a au moins le nom et le numéro
+        if horse.get("cheval"):
+            chevaux.append(horse)
+
+    return chevaux
+
+
 def extract_with_easyocr(image: Image.Image) -> dict:
-    """Extraction via EasyOCR (fallback local, précision réduite)."""
+    """
+    Extraction via EasyOCR (fallback local).
+    Produit des chevaux structurés grâce au parseur de lignes intégré.
+    """
     try:
         import easyocr
-        # FIX 🔴 Bug #1 : "import numpy as np as np_local" est une syntaxe invalide
-        # Correction : import séparé avec un alias distinct
+        # FIX 🔴 Bug #1 : "import numpy as np as np_local" était une syntaxe invalide
         import numpy as np_local
+
         reader = easyocr.Reader(["fr", "en"], gpu=False, verbose=False)
         img_array = np_local.array(image)
         results = reader.readtext(img_array, detail=1)
+
+        # Regrouper les textes par ligne (bucket Y de 20px)
         lines_by_y = {}
         for bbox, text, conf in results:
-            if conf < 0.3:
+            if conf < 0.25:          # seuil légèrement abaissé pour capter plus
                 continue
             y_center = int((bbox[0][1] + bbox[2][1]) / 2)
-            y_bucket = (y_center // 20) * 20
+            y_bucket = (y_center // 18) * 18   # bucket plus fin = meilleur alignement
             lines_by_y.setdefault(y_bucket, []).append((bbox[0][0], text.strip()))
+
         lines = []
         for y in sorted(lines_by_y):
             items = sorted(lines_by_y[y], key=lambda x: x[0])
-            lines.append(" | ".join(t for _, t in items))
+            line_text = " | ".join(t for _, t in items)
+            lines.append(line_text)
+
+        raw_text = "\n".join(lines)
+
+        # Tentative de parsing structuré
+        chevaux = _parse_easyocr_lines_to_chevaux(lines)
+
         return {
             "type": "raw_ocr",
-            "raw_text": "\n".join(lines),
+            "raw_text": raw_text,
             "lines": lines,
             "ocr_engine": "EasyOCR (mode basique)",
-            "chevaux": [],
-            "table_type": "unknown",
+            "chevaux": chevaux,
+            "table_type": "partants" if chevaux else "unknown",
         }
     except Exception as e:
         return {
@@ -1178,6 +1288,21 @@ if clicked and uploaded:
 
     st.session_state.raw_extractions = extractions
 
+    # Vérification anticipée : est-ce que l'OCR a trouvé des chevaux ?
+    total_horses_found = sum(len(e.get("chevaux", [])) for e in extractions)
+    ocr_errors = [e.get("error") for e in extractions if e.get("error")]
+
+    if total_horses_found == 0:
+        progress.empty()
+        # Stocker un df vide pour déclencher le mode saisie manuelle
+        st.session_state.df_scored = pd.DataFrame()
+        st.session_state.done = True
+        err_msg = ocr_errors[0] if ocr_errors else "Aucun tableau hippique reconnu"
+        status.warning(f"⚠️ OCR sans résultat : {err_msg}. Utilisez la saisie manuelle ci-dessous.")
+        time.sleep(1.5)
+        status.empty()
+        st.rerun()
+
     progress.progress(int(len(uploaded) / total_steps * 100))
     status.markdown("🔀 **Fusion** des données extraites...")
     merged = merge_extracted_data(extractions)
@@ -1203,22 +1328,109 @@ if clicked and uploaded:
     time.sleep(0.2)
 
     progress.empty()
-    status.success("✅ Analyse terminée avec succès !")
+    status.success(f"✅ Analyse terminée — {len(df_scored)} partants analysés !")
     time.sleep(0.6)
     status.empty()
     st.rerun()
+
+# ── SECTION 3 : SAISIE MANUELLE (fallback si OCR échoue) ─────────
+# Affichée uniquement si une analyse a été tentée mais a échoué
+_ocr_failed = (
+    st.session_state.done
+    and st.session_state.df_scored is not None
+    and ("score_global" not in st.session_state.df_scored.columns or st.session_state.df_scored.empty)
+)
+_no_result_yet = (
+    not st.session_state.done
+    and st.session_state.raw_extractions
+    and all(not e.get("chevaux") for e in st.session_state.raw_extractions)
+)
+
+if _ocr_failed or _no_result_yet:
+    st.divider()
+    st.error("""❌ **L'OCR n'a pas pu extraire les données hippiques.**
+
+**Causes fréquentes :**
+- 📸 L'image uploadée est un screenshot de l'app elle-même (pas un tableau PMU direct)
+- 🔑 Clé API manquante ou invalide → EasyOCR utilisé (très limité sur les tableaux)
+- 🖼️ Image trop floue, tronquée ou au format inhabituel
+
+**Solutions :**
+1. Uploadez **directement** les captures d'écran de [Paris-Turf](https://www.paris-turf.com), [Zeturf](https://www.zeturf.fr), PMU, etc.
+2. Vérifiez votre clé API Gemini/OpenAI dans la barre latérale
+3. Utilisez la **saisie manuelle** ci-dessous comme secours
+""")
+
+    # Afficher le debug OCR
+    if st.session_state.raw_extractions:
+        with st.expander("🔍 Voir la réponse brute de l'OCR (debug)"):
+            for i, ext in enumerate(st.session_state.raw_extractions):
+                st.markdown(f"**Image {i+1}** — Moteur : `{ext.get('ocr_engine','?')}`")
+                if ext.get("error"):
+                    st.error(f"Erreur : {ext['error']}")
+                st.json({k: v for k, v in ext.items() if k != "raw_text"})
+                if ext.get("raw_text"):
+                    st.text_area(f"Texte brut image {i+1}", ext["raw_text"], height=120)
+
+    st.divider()
+    st.markdown("### ✏️ Saisie Manuelle des Partants (mode secours)")
+    st.markdown("""
+    <div class='card'>
+    <p>Si l'OCR échoue, entrez les données directement. Renseignez au minimum :
+    <strong>numéro, nom, musique et cote PMU</strong>.</p>
+    </div>""", unsafe_allow_html=True)
+
+    # Nombre de partants
+    nb_manual = st.number_input("Nombre de partants", min_value=2, max_value=20, value=8, step=1)
+
+    manual_horses = []
+    for i in range(int(nb_manual)):
+        with st.expander(f"Cheval #{i+1}", expanded=(i < 3)):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                num  = st.number_input("N°",          key=f"m_num_{i}",  min_value=1, max_value=30, value=i+1)
+                nom  = st.text_input("Nom",            key=f"m_nom_{i}",  value="")
+                sa   = st.text_input("SA (ex: H7)",   key=f"m_sa_{i}",   value="")
+            with c2:
+                mus  = st.text_input("Musique",        key=f"m_mus_{i}",  value="")
+                cote = st.number_input("Cote PMU",     key=f"m_cote_{i}", min_value=0.0, value=0.0, step=0.1, format="%.1f")
+                gains= st.number_input("Gains (€)",   key=f"m_gains_{i}",min_value=0,   value=0,   step=1000)
+            with c3:
+                drv  = st.text_input("Driver",         key=f"m_drv_{i}",  value="")
+                entr = st.text_input("Entraîneur",     key=f"m_entr_{i}", value="")
+                rdpct= st.number_input("% Driver",     key=f"m_rdpct_{i}",min_value=0.0, max_value=100.0, value=0.0, step=0.5, format="%.1f")
+
+            manual_horses.append({
+                "numero": int(num), "cheval": nom, "sa": sa,
+                "musique": mus, "cote_pmu": float(cote), "gains": int(gains),
+                "driver": drv, "entraineur": entr, "reussite_driver": float(rdpct),
+            })
+
+    if st.button("🎯 Analyser la saisie manuelle", use_container_width=True):
+        # Filtrer les lignes vides (sans nom)
+        valid = [h for h in manual_horses if h.get("cheval", "").strip()]
+        if len(valid) < 2:
+            st.warning("⚠️ Renseignez au moins 2 chevaux avec un nom.")
+        else:
+            with st.spinner("Calcul des scores en cours..."):
+                df_manual = clean_horse_data(valid)
+                df_scored_manual = calculate_scores(df_manual, race_type)
+                pronostic_manual = generate_pronostic_report(df_scored_manual)
+                st.session_state.df_cleaned   = df_manual
+                st.session_state.df_scored    = df_scored_manual
+                st.session_state.pronostic    = pronostic_manual
+                st.session_state.done         = True
+                st.session_state.raw_extractions = []
+            st.rerun()
 
 # ── RÉSULTATS ────────────────────────────────────────────────────
 if st.session_state.done and st.session_state.df_scored is not None:
     df = st.session_state.df_scored
     pronostic = st.session_state.pronostic
 
-    # FIX 🔴 Bug #3 : KeyError 'score_global' si calculate_scores() a retourné
-    # un df sans la colonne (ex. df vide en entrée ou erreur upstream).
-    # On vérifie explicitement avant tout sort_values / accès.
+    # Guard : score_global absent si df vide ou calcul raté
     if "score_global" not in df.columns or df.empty:
-        st.error("❌ Le calcul des scores a échoué — données insuffisantes ou mal extraites. "
-                 "Vérifiez la qualité de vos images et réessayez.")
+        # Ne pas afficher d'erreur ici — déjà géré par le bloc _ocr_failed ci-dessus
         st.stop()
 
     n_part = len(df)

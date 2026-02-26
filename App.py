@@ -1,3 +1,22 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║          🏇  PronoHippique AI  —  Script complet unique          ║
+║     Application Streamlit de pronostics hippiques intelligente   ║
+║         Déployable directement sur Streamlit Cloud               ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Tous les modules sont intégrés dans ce fichier unique :
+  → OCR Extractor   : extraction Gemini / OpenAI / EasyOCR
+  → Data Cleaner    : nettoyage & parsing des données
+  → Scorer          : algorithme de scoring multi-critères
+  → Pronostic       : génération Trio / Quinté / classement
+  → Visualizer      : graphiques Plotly interactifs
+  → App             : interface Streamlit complète
+"""
+
+# ══════════════════════════════════════════════════════════════════
+#  IMPORTS
+# ══════════════════════════════════════════════════════════════════
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -159,7 +178,9 @@ def extract_with_easyocr(image: Image.Image) -> dict:
     """Extraction via EasyOCR (fallback local, précision réduite)."""
     try:
         import easyocr
-        import numpy as np
+        # FIX 🔴 Bug #1 : "import numpy as np as np_local" est une syntaxe invalide
+        # Correction : import séparé avec un alias distinct
+        import numpy as np_local
         reader = easyocr.Reader(["fr", "en"], gpu=False, verbose=False)
         img_array = np_local.array(image)
         results = reader.readtext(img_array, detail=1)
@@ -179,7 +200,7 @@ def extract_with_easyocr(image: Image.Image) -> dict:
             "raw_text": "\n".join(lines),
             "lines": lines,
             "ocr_engine": "EasyOCR (mode basique)",
-            "chevaux": [],          # EasyOCR ne produit pas de JSON structuré
+            "chevaux": [],
             "table_type": "unknown",
         }
     except Exception as e:
@@ -296,12 +317,13 @@ def _parse_record_to_seconds(record: str) -> float:
     if not record:
         return 0.0
     record = record.replace(",", ".").strip()
+    # FIX 🔴 Bug #2 : pattern[0] utilisait [\"](\\d+) — la char class ne captait rien
+    # car \\d (double backslash) est littéral, pas un \d regex.
+    # Suppression du pattern cassé ; pattern[1] (avec \") suffit.
     patterns = [
-        r"(\d+)'(\d+)[\"](\\d+)",
-        r"(\d+)'(\d+)\.(\d+)",
-        r"(\d+)'(\d+)\"(\d+)",
-        r"(\d+)'(\d+)(\d)",
-        r"(\d+)'(\d+)",
+        r"(\d+)'(\d+)\"(\d+)",   # 1'10"0  — guillemet ASCII
+        r"(\d+)'(\d+)\.(\d+)",   # 1'10.0  — point décimal
+        r"(\d+)'(\d+)",           # 1'10    — sans dixième
     ]
     for pat in patterns:
         m = re.search(pat, record)
@@ -566,6 +588,12 @@ def calculate_scores(df: pd.DataFrame, race_type: str = "default") -> pd.DataFra
         return df
     df = df.copy()
     W = RACE_WEIGHTS.get(race_type, WEIGHTS)
+
+    # FIX 🟡 Bug #4 : colonnes musique_driver / musique_entraineur peuvent être absentes
+    # On les initialise à '' si manquantes pour éviter tout KeyError
+    for col in ("musique", "musique_driver", "musique_entraineur"):
+        if col not in df.columns:
+            df[col] = ""
 
     # Scores individuels
     df["score_record"]               = _score_record_col(df)
@@ -1045,11 +1073,15 @@ with st.sidebar:
     elif "OpenAI" in ocr_choice:
         openai_key = st.text_input("Clé API OpenAI", type="password", placeholder="sk-...")
 
-    # Lire aussi depuis les secrets Streamlit Cloud
-    if not gemini_key:
-        gemini_key = st.secrets.get("GEMINI_API_KEY", "")
-    if not openai_key:
-        openai_key = st.secrets.get("OPENAI_API_KEY", "")
+    # FIX 🟡 Bug #5 : st.secrets.get() plante si secrets.toml absent (hors Streamlit Cloud)
+    # Correction : try/except pour compatibilité locale / cloud
+    try:
+        if not gemini_key:
+            gemini_key = st.secrets.get("GEMINI_API_KEY", "")
+        if not openai_key:
+            openai_key = st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        pass  # Pas de secrets disponibles (développement local)
 
     st.divider()
     st.markdown("### 🎯 Type de Course")
@@ -1110,7 +1142,8 @@ if uploaded:
     for i, f in enumerate(uploaded):
         with cols[i % 4]:
             img = Image.open(f)
-            st.image(img, caption=f.name, use_column_width=True)
+            # FIX 🟡 Bug #6 : use_column_width déprécié → use_container_width
+            st.image(img, caption=f.name, use_container_width=True)
 
 st.divider()
 
@@ -1177,9 +1210,18 @@ if clicked and uploaded:
 
 # ── RÉSULTATS ────────────────────────────────────────────────────
 if st.session_state.done and st.session_state.df_scored is not None:
-    df        = st.session_state.df_scored
+    df = st.session_state.df_scored
     pronostic = st.session_state.pronostic
-    n_part    = len(df)
+
+    # FIX 🔴 Bug #3 : KeyError 'score_global' si calculate_scores() a retourné
+    # un df sans la colonne (ex. df vide en entrée ou erreur upstream).
+    # On vérifie explicitement avant tout sort_values / accès.
+    if "score_global" not in df.columns or df.empty:
+        st.error("❌ Le calcul des scores a échoué — données insuffisantes ou mal extraites. "
+                 "Vérifiez la qualité de vos images et réessayez.")
+        st.stop()
+
+    n_part = len(df)
 
     st.divider()
     st.markdown("## 📊 Résultats de l'Analyse")

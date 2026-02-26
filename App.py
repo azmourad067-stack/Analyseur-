@@ -1402,7 +1402,3 @@ st.markdown("""
     <em>⚠️ Avertissement : Les pronostics sont fournis à titre indicatif uniquement.
     Le jeu peut créer une dépendance. Jouez de manière responsable.</em><br>
     <small>Joueurs Info Service : <strong>09 74 75 13 13</strong></small>
-</div>
-""", unsafe_allow_html=True)
-Response
-Created file /home/user/single_app/app.py 

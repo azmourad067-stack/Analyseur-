@@ -250,7 +250,7 @@ if uploaded_files:
         with cols[i % 4]:
             st.image(Image.open(f), caption=f.name, use_container_width=True)
     
-   if st.button("🚀 Lancer l'analyse", use_container_width=True):
+if st.button("🚀 Lancer l'analyse", use_container_width=True):
     all_horses = []
     raw_texts = []
     progress = st.progress(0)

@@ -250,19 +250,18 @@ if uploaded_files:
         with cols[i % 4]:
             st.image(Image.open(f), caption=f.name, use_container_width=True)
     
-    if st.button("🚀 Lancer l'analyse", use_container_width=True):
-        all_horses = []
-        raw_texts = []
-        progress = st.progress(0)
-        for i, f in enumerate(uploaded_files):
-            progress.progress((i+1) / len(uploaded_files) * 50)
-            img = Image.open(f).convert("RGB")
-            with st.spinner(f"OCR sur {f.name}..."):
-                text = extract_text_from_image(img)
-                raw_texts.append(f"--- {f.name} ---\n{text}\n")
-                horses = parse_horses_from_text(text)
-                all_horses.extend(horses)
-        
+   if st.button("🚀 Lancer l'analyse", use_container_width=True):
+    all_horses = []
+    raw_texts = []
+    progress = st.progress(0)
+    for i, f in enumerate(uploaded_files):
+        progress.progress((i+1) / len(uploaded_files))   # ✅ correction ici
+        img = Image.open(f).convert("RGB")
+        with st.spinner(f"OCR sur {f.name}..."):
+            text = extract_text_from_image(img)
+            raw_texts.append(f"--- {f.name} ---\n{text}\n")
+            horses = parse_horses_from_text(text)
+            all_horses.extend(horses)
         # Fusion et déduplication
         unique_horses = {}
         for h in all_horses:

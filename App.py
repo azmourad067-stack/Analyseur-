@@ -16,6 +16,14 @@
  ✅ Backtester intégré (mode validation)
  ✅ Architecture modulaire en classes
  ✅ Diagnostic complet (calibration, divergence, edge expected)
+ ✅ NOUVEAUTÉS v4.0.1 :
+   • Kelly basé sur l'entropie de la course (remplace la volatilité)
+   • Détecteur de faux favoris (favorite-longshot bias inversé)
+   • Momentum de la musique (progression / régression)
+   • Monte Carlo adaptatif (ajustement du bruit et du nombre de tirages)
+   • Benter 3D (intégration d'un vecteur empirique)
+   • Filtre Value renforcé (ratio + edge)
+   • Bonus pour forte progression
 ═══════════════════════════════════════════════════════════════════════════════
 Sources scientifiques :
 - Benter, W. (1994). "Computer Based Horse Race Handicapping" (Hong Kong)
@@ -49,7 +57,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Config:
     # --- App ---
-    APP_VERSION: str = "4.0.0"
+    APP_VERSION: str = "4.0.1"
     APP_NAME: str = "QuantTurf Pro"
     APP_TAG: str = "Benter Edition"
 
@@ -62,6 +70,7 @@ class Config:
     MARKET_WEIGHT: float = 0.35        # poids du marché dans Benter Blend
     BENTER_ALPHA: float = 1.10         # exposant log(p_model)
     BENTER_BETA: float = 0.90          # exposant log(p_market)
+    BENTER_GAMMA: float = 0.35         # exposant pour le vecteur empirique
     OVERROUND_CORRECTION: bool = True  # corriger le biais favori-outsider
 
     # --- Value / Kelly ---
@@ -163,7 +172,7 @@ CONFIG = Config()
 
 
 # =============================================================================
-# 2.  PARSING DE LA MUSIQUE (avec shrinkage bayésien)
+# 2.  PARSING DE LA MUSIQUE (avec shrinkage bayésien et momentum)
 # =============================================================================
 @dataclass
 class MusicMetrics:
@@ -180,6 +189,17 @@ class MusicMetrics:
     consistency: float = 0.0
     shrunk_score: float = 0.0    # score après shrinkage bayésien
     shrunk_win_ratio: float = 0.0
+    momentum: float = 0.0        # progression récente (positif = amélioration)
+
+
+def _momentum_score(positions: List[int]) -> float:
+    """Calcule le momentum : différence entre moyenne des 3 plus anciennes
+    et des 3 plus récentes. Positif = progression."""
+    if len(positions) < 6:
+        return 0.0
+    recent = np.mean(positions[:3])
+    old = np.mean(positions[3:6])
+    return old - recent
 
 
 @lru_cache(maxsize=1024)
@@ -188,6 +208,7 @@ def parse_music_v4(music_str: str) -> MusicMetrics:
     Parse la musique d'un cheval/driver/entraîneur.
     Format type : '1a2a3a(23)4aDa5a' (chiffres + type de course)
     Applique un shrinkage bayésien vers la moyenne population.
+    Ajoute le momentum (progression / régression).
     """
     if (not music_str or
             music_str.strip().upper() in ("", "-", "INEDIT", "INÉDIT", "N/A", "0")):
@@ -200,6 +221,7 @@ def parse_music_v4(music_str: str) -> MusicMetrics:
             podium_ratio=0.30,
             shrunk_score=CONFIG.POPULATION_MEAN_SCORE,
             shrunk_win_ratio=CONFIG.POPULATION_MEAN_WIN,
+            momentum=0.0,
         )
     try:
         clean = re.sub(r"[()\s]", "", music_str.strip().upper())
@@ -254,11 +276,12 @@ def parse_music_v4(music_str: str) -> MusicMetrics:
         # --- Consistance ---
         consistency = max(0.0, min(1.0, 1.0 - pos_std / 10.0))
 
+        # --- Momentum (progression) ---
+        momentum = _momentum_score(numeric_positions)
+
         # ──────────────────────────────────────────────────────────
         # SHRINKAGE BAYÉSIEN
         # ──────────────────────────────────────────────────────────
-        # Formule : score_shrunk = (n*score + K*μ_pop) / (n+K)
-        # Plus n est petit, plus on tire vers la moyenne population
         K = CONFIG.SHRINKAGE_K
         shrunk_score = (n * weighted_score + K * CONFIG.POPULATION_MEAN_SCORE) / (n + K)
         shrunk_win = (n * win_ratio + K * CONFIG.POPULATION_MEAN_WIN) / (n + K)
@@ -277,6 +300,7 @@ def parse_music_v4(music_str: str) -> MusicMetrics:
             consistency=consistency,
             shrunk_score=float(shrunk_score),
             shrunk_win_ratio=float(shrunk_win),
+            momentum=momentum,
         )
     except Exception as e:
         logger.warning(f"Music parsing error '{music_str}': {e}")
@@ -390,7 +414,7 @@ def rest_factor(days_since_last_race: int) -> float:
 
 
 # =============================================================================
-# 4.  SCORE COMPOSITE (entrée du modèle softmax)
+# 4.  SCORE COMPOSITE (entrée du modèle softmax) — avec momentum
 # =============================================================================
 def get_weights_v4(race_type: str) -> Dict[str, float]:
     """Poids normalisés par discipline. Total ≈ 1.0."""
@@ -399,6 +423,7 @@ def get_weights_v4(race_type: str) -> Dict[str, float]:
             # Cheval (45%)
             "horse_score": 0.22, "horse_form": 0.10, "horse_regularity": 0.05,
             "horse_trend": 0.04, "horse_win": 0.04,
+            "horse_momentum": 0.08,   # <-- nouveau
             # Jockey (20%)
             "driver_score": 0.10, "driver_form": 0.05, "driver_win": 0.05,
             # Entraîneur (15%)
@@ -411,6 +436,7 @@ def get_weights_v4(race_type: str) -> Dict[str, float]:
             # Cheval (35%)
             "horse_score": 0.18, "horse_form": 0.08, "horse_regularity": 0.04,
             "horse_trend": 0.03, "horse_win": 0.02,
+            "horse_momentum": 0.08,   # <-- nouveau
             # Driver/jockey (32%) — TRÈS important au trot
             "driver_score": 0.16, "driver_form": 0.09, "driver_win": 0.07,
             # Entraîneur (18%)
@@ -422,6 +448,7 @@ def get_weights_v4(race_type: str) -> Dict[str, float]:
         return {
             "horse_score": 0.24, "horse_form": 0.12, "horse_regularity": 0.06,
             "horse_trend": 0.04, "horse_win": 0.03,
+            "horse_momentum": 0.08,   # <-- nouveau
             "driver_score": 0.12, "driver_form": 0.06, "driver_win": 0.04,
             "trainer_score": 0.12, "trainer_form": 0.06, "trainer_win": 0.04,
             "draw_factor": 0.00, "synergy": 0.03, "weight_adj": 0.02, "rest_adj": 0.02,
@@ -429,7 +456,9 @@ def get_weights_v4(race_type: str) -> Dict[str, float]:
 
 
 def composite_score_v4(feat: Dict, weights: Dict) -> float:
-    """Score linéaire pondéré. Sera ensuite passé en softmax."""
+    """Score linéaire pondéré. Sera ensuite passé en softmax.
+    Ajoute le momentum et un bonus en cas de forte progression.
+    """
     s = 0.0
 
     s += weights["horse_score"]      * np.clip(feat["horse_score"], 0, 12)
@@ -437,6 +466,10 @@ def composite_score_v4(feat: Dict, weights: Dict) -> float:
     s += weights["horse_regularity"] * np.clip(feat["horse_regularity"], 0, 1) * 10
     s += weights["horse_trend"]      * (np.clip(feat["horse_trend"], -1, 1) + 1) * 5
     s += weights["horse_win"]        * np.clip(feat["horse_win"], 0, 1) * 20
+
+    # --- Momentum ---
+    if weights.get("horse_momentum", 0) > 0:
+        s += weights["horse_momentum"] * feat.get("horse_momentum", 0.0)
 
     s += weights["driver_score"] * np.clip(feat["driver_score"], 0, 12)
     s += weights["driver_form"]  * np.clip(feat["driver_form"], 0, 12)
@@ -461,12 +494,19 @@ def composite_score_v4(feat: Dict, weights: Dict) -> float:
     s += weights.get("weight_adj", 0) * (feat.get("weight_factor", 1.0) - 1.0) * 50
     s += weights.get("rest_adj",   0) * (feat.get("rest_factor",   1.0) - 1.0) * 50
 
+    # Bonus pour forte progression
+    momentum_val = feat.get("horse_momentum", 0.0)
+    if momentum_val > 1.5:
+        s *= 1.08
+    if momentum_val > 2.5:
+        s *= 1.15
+
     # Bruit minimal pour briser les égalités
     return max(0.05, s)
 
 
 # =============================================================================
-# 5.  MOTEUR PROBABILISTE — Softmax + Benter Blend + Plackett-Luce
+# 5.  MOTEUR PROBABILISTE — Softmax + Benter Blend 3D + Plackett-Luce
 # =============================================================================
 def softmax_temp(scores: np.ndarray, T: float = 1.0) -> np.ndarray:
     s = np.asarray(scores, dtype=float) / max(T, 0.05)
@@ -538,8 +578,30 @@ def plackett_luce_simulate(strengths: np.ndarray, n_iter: int,
     return orders
 
 
+def race_entropy(probabilities: np.ndarray) -> float:
+    """Entropie de Shannon d'une distribution de probabilités."""
+    p = np.asarray(probabilities)
+    p = p / (p.sum() + 1e-12)
+    return -np.sum(p * np.log(p + 1e-12))
+
+
+def empirical_vector(feats: List[Dict]) -> np.ndarray:
+    """
+    Construit un vecteur de probabilités empirique à partir des facteurs
+    de corde, repos et poids. Utilisé comme troisième composante du Benter 3D.
+    """
+    v = []
+    for f in feats:
+        x = (f.get("draw_factor", 0.0) *
+             f.get("rest_factor", 1.0) *
+             f.get("weight_factor", 1.0))
+        v.append(max(x, 0.01))
+    v = np.array(v)
+    return v / v.sum()
+
+
 # =============================================================================
-# 6.  CORRECTION EMPIRIQUE (corde + expérience)
+# 6.  CORRECTION EMPIRIQUE (corde + expérience) — conservée mais moins utilisée
 # =============================================================================
 def empirical_win_prob(draw: int, race_type: str, distance: int,
                        depart_type: str) -> float:
@@ -567,6 +629,7 @@ def empirical_correction(p_model: np.ndarray, draws: List[int],
                          exp_factors: np.ndarray, weight: float = None) -> np.ndarray:
     """
     Mélange convexe entre proba modèle et proba empirique pondérée par expérience.
+    (Conservé pour compatibilité, mais le Benter 3D intègre déjà un vecteur empirique)
     """
     if weight is None:
         weight = CONFIG.EMPIRICAL_WEIGHT
@@ -818,7 +881,7 @@ def best_place_bet(results: List[Dict], n_runners: int) -> Optional[Dict]:
 
 
 # =============================================================================
-# 9.  MOTEUR PRINCIPAL — RaceEngine v4
+# 9.  MOTEUR PRINCIPAL — RaceEngine v4.0.1
 # =============================================================================
 class RaceEngine:
     """Encapsule toute la logique de prédiction pour une course."""
@@ -865,6 +928,7 @@ class RaceEngine:
                 "horse_regularity": m_h.regularity,
                 "horse_trend": m_h.trend,
                 "horse_win": m_h.shrunk_win_ratio,
+                "horse_momentum": m_h.momentum,            # <-- nouveau
                 "horse_is_debutant": m_h.is_debutant,
                 "driver_score": m_d.shrunk_score * exp_d,
                 "driver_form": m_d.recent_form,
@@ -895,7 +959,7 @@ class RaceEngine:
         # === ÉTAPE 1 : Probabilité modèle pure (softmax) ===
         p_model_raw = softmax_temp(scores, T=CONFIG.TEMPERATURE)
 
-        # === ÉTAPE 2 : Correction empirique (corde + expérience) ===
+        # === ÉTAPE 2 : Correction empirique (corde + expérience) — optionnelle ===
         p_model = empirical_correction(p_model_raw, draws, self.race_type,
                                          self.distance, self.depart_type,
                                          exp_factors)
@@ -908,20 +972,34 @@ class RaceEngine:
         else:
             p_market = np.ones(self.n) / self.n
 
-        # === ÉTAPE 4 : Benter Blend ===
-        if has_market and market_weight > 0:
-            # Mélange Benter pondéré : on règle β en fonction du market_weight
-            beta_eff = CONFIG.BENTER_BETA * (market_weight / 0.35)
-            p_final = benter_blend(p_model, p_market,
-                                    alpha=CONFIG.BENTER_ALPHA,
-                                    beta=beta_eff)
-        else:
-            p_final = p_model
+        # === ÉTAPE 4 : Benter Blend 3D (modèle, marché, empirique) ===
+        # Calcul du vecteur empirique (corde, repos, poids)
+        p_empirical = empirical_vector(feats)
 
-        # === ÉTAPE 5 : Simulation Plackett-Luce pour exotiques + place ===
-        # On reconstruit des forces compatibles avec p_final
+        beta_eff = CONFIG.BENTER_BETA * (market_weight / 0.35) if has_market and market_weight > 0 else 0.0
+
+        # Fusion multiplicative
+        blend = (np.power(p_model, CONFIG.BENTER_ALPHA) *
+                 np.power(p_market, beta_eff) *
+                 np.power(p_empirical, CONFIG.BENTER_GAMMA))
+        p_final = blend / blend.sum()
+
+        # === ÉTAPE 5 : Monte Carlo adaptatif (ajustement du bruit et du nombre de tirages) ===
+        sorted_p = np.sort(p_final)[::-1]
+        gap = sorted_p[0] - sorted_p[1]
+
+        if gap > 0.12:
+            dynamic_noise = 0.12
+            mc_iter = max(3000, mc_iter // 2)
+        elif gap > 0.08:
+            dynamic_noise = 0.15
+        else:
+            dynamic_noise = 0.22
+            mc_iter = int(mc_iter * 1.5)
+
+        # Simulation Plackett-Luce avec paramètres adaptatifs
         strengths = p_final * 100  # échelle arbitraire
-        orders = plackett_luce_simulate(strengths, mc_iter, noise=CONFIG.NOISE_BASE)
+        orders = plackett_luce_simulate(strengths, mc_iter, noise=dynamic_noise)
 
         # Probabilités de place (top 3) via PL
         place_counts = np.zeros(self.n)
@@ -933,18 +1011,11 @@ class RaceEngine:
         p_place_mc = place_counts / mc_iter
         p_win_mc = win_counts / mc_iter
 
-        # Volatilité : écart entre p_final et p_win_mc
-        volatility = np.abs(p_final - p_win_mc) / (p_final + 1e-9)
-
-    def race_entropy(probabilities):
-    p = np.asarray(probabilities)
-    p = p / p.sum()
-    return -np.sum(p * np.log(p + 1e-12))
-    entropy = race_entropy(p_final)
-
-max_entropy = np.log(len(p_final))
-
-entropy_ratio = entropy / max_entropy
+        # === Entropie de la course (pour Kelly) ===
+        entropy = race_entropy(p_final)
+        max_entropy = np.log(self.n)
+        entropy_ratio = entropy / max_entropy  # entre 0 et 1
+        entropy_penalty = 1.0 + entropy_ratio  # >1 pour course ouverte
 
         # === ÉTAPE 6 : Construction des résultats ===
         results = []
@@ -962,26 +1033,22 @@ entropy_ratio = entropy / max_entropy
             dyn_value_th = value_threshold
 
         for i, (feat, horse) in enumerate(zip(feats, self.horses)):
+            # Nouveau filtre Value : ratio + edge + proba minimale
             ratio = p_final[i] / (p_market[i] + 1e-9)
-            def false_favorite_score(model_p, market_p):
-    if model_p <= 0:
-        return 0
+            edge = p_final[i] - p_market[i]
+            is_value = (ratio >= dyn_value_th) and (edge > 0.03) and (p_final[i] >= 0.05)
 
-    return market_p / model_p
-"is_false_favorite": ff_score > 1.6,
-"false_favorite_score": round(ff_score,2),
-false_favorites = [
-    r for r in results
-    if r["is_false_favorite"]
-]
-            is_value = (ratio >= dyn_value_th) and (p_final[i] >= 0.04)
-            entropy_penalty = 1 + entropy_ratio
+            # Kelly avec pénalité d'entropie
             k_pur, k_reco = kelly_bet(
-    p_final[i],
-    horse.get("odds", 2.0),
-    volatility=entropy_penalty
-)
+                p_final[i],
+                horse.get("odds", 2.0),
+                volatility=entropy_penalty
+            )
             roi = expected_roi(p_final[i], horse.get("odds", 2.0))
+
+            # Faux favori
+            ff_score = p_market[i] / (p_final[i] + 1e-9)  # >1 si marché surcote
+            is_false_favorite = ff_score > 1.6
 
             results.append({
                 "rank": 0,
@@ -994,11 +1061,14 @@ false_favorites = [
                 "place_prob": round(float(p_place_mc[i]) * 100, 2),
                 "composite_score": round(float(scores[i]), 3),
                 "value_ratio": round(float(ratio), 2),
+                "edge": round(float(edge), 4),
                 "is_value_bet": bool(is_value),
                 "kelly_pure": round(k_pur, 4),
                 "kelly_recommended": round(k_reco, 4),
                 "expected_roi": round(roi, 2),
-                "volatility": round(float(volatility[i]), 3),
+                "momentum": round(feat.get("horse_momentum", 0.0), 3),
+                "is_false_favorite": is_false_favorite,
+                "false_favorite_score": round(ff_score, 2),
                 "draw": draws[i],
                 "draw_factor": round(feat["draw_factor"], 3),
             })
@@ -1014,11 +1084,11 @@ false_favorites = [
         # === Diagnostic ===
         sorted_p = sorted([r["win_prob"] for r in results], reverse=True)
         if len(sorted_p) >= 2:
-            gap = sorted_p[0] - sorted_p[1]
-            conf_idx = min(100, round(45 + gap * 2.5, 1))
+            gap_win = sorted_p[0] - sorted_p[1]
+            conf_idx = min(100, round(45 + gap_win * 2.5, 1))
         else:
             conf_idx = 50
-        vol_idx = min(100, round(volatility.mean() * 60, 1))
+        vol_idx = min(100, round(entropy_ratio * 100, 1))  # basé sur entropie
 
         # KL divergence modèle / marché (mesure de désaccord)
         if has_market:
@@ -1026,6 +1096,9 @@ false_favorites = [
             kl = float(np.sum(p_final * np.log((p_final + eps) / (p_market + eps))))
         else:
             kl = None
+
+        # Faux favoris (pour affichage)
+        false_favs = [r for r in results if r["is_false_favorite"]]
 
         return {
             "results": results,
@@ -1036,6 +1109,8 @@ false_favorites = [
             "overround_pct": overround_pct,
             "dynamic_value_threshold": round(dyn_value_th, 3),
             "kl_divergence": round(kl, 3) if kl else None,
+            "entropy_ratio": round(entropy_ratio, 3),
+            "false_favorites": false_favs,
             "execution_time": round(time.time() - t0, 2),
             "n_simulations": mc_iter,
         }
@@ -1063,6 +1138,7 @@ def apply_css():
         padding: 10px;
     }
     .value-bet { color:#00ff88; font-weight:bold; }
+    .false-fav { color:#ff6b6b; font-weight:bold; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1077,7 +1153,7 @@ def render_header():
         🏇 {CONFIG.APP_NAME} v{CONFIG.APP_VERSION}
       </h1>
       <p style="color:#7b9ec4; font-size:1.05em; margin-top:-10px;">
-        <em>{CONFIG.APP_TAG}</em> — Plackett-Luce · Benter Blend · Kelly dynamique
+        <em>{CONFIG.APP_TAG}</em> — Plackett-Luce · Benter 3D · Kelly entropique
       </p>
     </div>
     """, unsafe_allow_html=True)
@@ -1114,19 +1190,22 @@ def main():
         with st.expander("🔬 Monte Carlo / Plackett-Luce", expanded=True):
             mc_iter = st.slider("Itérations PL", 1000, 15000,
                                 CONFIG.MC_ITERATIONS, 500)
-            noise = st.slider("Bruit log-normal", 0.05, 0.40,
+            noise = st.slider("Bruit log-normal (base)", 0.05, 0.40,
                               CONFIG.NOISE_BASE, 0.01)
             CONFIG.NOISE_BASE = noise
 
-        with st.expander("🎯 Marché & Benter Blend", expanded=True):
+        with st.expander("🎯 Marché & Benter 3D", expanded=True):
             mw = st.slider("Poids du marché", 0.0, 0.70,
                            CONFIG.MARKET_WEIGHT, 0.05)
             alpha = st.slider("α (exposant modèle)", 0.5, 2.0,
                               CONFIG.BENTER_ALPHA, 0.05)
             beta = st.slider("β (exposant marché)", 0.0, 2.0,
                              CONFIG.BENTER_BETA, 0.05)
+            gamma = st.slider("γ (exposant empirique)", 0.0, 1.0,
+                              CONFIG.BENTER_GAMMA, 0.05)
             CONFIG.BENTER_ALPHA = alpha
             CONFIG.BENTER_BETA = beta
+            CONFIG.BENTER_GAMMA = gamma
             CONFIG.OVERROUND_CORRECTION = st.checkbox(
                 "Débiaiser favori/outsider", value=True,
                 help="Correction power du biais favori-outsider")
@@ -1268,7 +1347,7 @@ def main():
             st.markdown("## 📈 Diagnostic de course")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("🎯 Confiance", f"{pred['confidence_idx']:.1f}/100")
-            c2.metric("🌪️ Volatilité", f"{pred['volatility_idx']:.1f}/100")
+            c2.metric("🌪️ Entropie (vol.)", f"{pred['volatility_idx']:.1f}/100")
             if pred["overround_pct"] is not None:
                 c3.metric("📉 Overround", f"{pred['overround_pct']:.1f}%",
                           help="Marge bookmaker (>20% = juice élevé)")
@@ -1281,6 +1360,18 @@ def main():
                 st.caption(f"🧮 Divergence KL(modèle ‖ marché) = "
                            f"**{pred['kl_divergence']:.3f}** — "
                            f"{'fort désaccord' if pred['kl_divergence'] > 0.15 else 'accord modéré'}")
+
+            # Alerte faux favoris
+            if pred.get("false_favorites"):
+                st.markdown("### ⚠️ Favori PMU probablement surjoué")
+                for ff in pred["false_favorites"]:
+                    st.markdown(
+                        f"- **N°{ff['number']} {ff['name']}** : "
+                        f"score faux favori = **{ff['false_favorite_score']:.2f}** "
+                        f"(marché surcote par rapport au modèle)"
+                    )
+                st.caption("Ces chevaux sont trop joués par le public et présentent "
+                           "probablement une value négative.")
 
             st.markdown("---")
             st.markdown("## 🏆 Classement final & paris GAGNANT")
@@ -1296,8 +1387,9 @@ def main():
                 "Ratio": f"{r['value_ratio']:.2f}",
                 "ROI %": f"{r['expected_roi']:+.1f}",
                 "Kelly %": f"{r['kelly_recommended']*100:.2f}",
-                "Vol.": f"{r['volatility']:.2f}",
+                "Momentum": f"{r['momentum']:.2f}",
                 "Value": "🟢" if r["is_value_bet"] else "⚪",
+                "Faux F.": "⚠️" if r["is_false_favorite"] else "",
             } for r in pred["results"]])
             st.dataframe(df, use_container_width=True, hide_index=True, height=380)
 
@@ -1310,7 +1402,7 @@ def main():
                         f"- **N°{vb['number']} {vb['name']}** "
                         f"@ cote {vb['odds']:.2f} — "
                         f"prob. modèle {vb['win_prob']:.1f}% vs marché {vb['win_prob_market']:.1f}% "
-                        f"→ Kelly recommandé : **{vb['kelly_recommended']*100:.2f}%** "
+                        f"(edge {vb['edge']:.3f}) → Kelly recommandé : **{vb['kelly_recommended']*100:.2f}%** "
                         f"(ROI espéré : {vb['expected_roi']:+.1f}%)"
                     )
             else:
@@ -1364,72 +1456,6 @@ def main():
     # ---------- TAB 3 : AIDE ----------
     with tab3:
         st.markdown("""
-## 🎓 Méthodologie QuantTurf v4.0
+## 🎓 Méthodologie QuantTurf v4.0.1
 
 ### 🔬 Architecture du moteur
-
-```
-Musique → Parsing + Shrinkage bayésien → Score composite
-                                              ↓
-                                          Softmax
-                                              ↓
-                                  Correction empirique (corde+exp)
-                                              ↓
-                                       p_modèle
-                                              ↓
-Cotes marché → Débiaisage power → p_marché
-                                              ↓
-                              BENTER BLEND : p ∝ p_modèle^α · p_marché^β
-                                              ↓
-                          Plackett-Luce (5000 ordres simulés)
-                                              ↓
-                    Win / Place / Couplé / Trio / Quarté+ / Quinté+
-                                              ↓
-                                   Kelly dynamique + ROI
-```
-
-### 📚 Formules clés
-
-**1. Shrinkage bayésien (musique)**
-$$\\text{score}_{\\text{shrunk}} = \\frac{n \\cdot \\text{score}_{\\text{obs}} + K \\cdot \\mu_{\\text{pop}}}{n + K}$$
-
-**2. Débiaisage des cotes (favori-outsider correction)**
-$$p_{\\text{vraie}} \\propto \\left(\\frac{1}{\\text{cote}}\\right)^\\gamma, \\quad \\gamma \\approx 1.12$$
-
-**3. Benter Blend**
-$$p_{\\text{finale}} \\propto p_{\\text{modèle}}^\\alpha \\cdot p_{\\text{marché}}^\\beta$$
-
-**4. Plackett-Luce (Harville)** — ordre d'arrivée séquentiel proportionnel aux forces.
-
-**5. Kelly fractionnaire dynamique**
-$$f^* = \\frac{p \\cdot b - q}{b}, \\quad f_{\\text{misé}} = \\min\\left(f^* \\cdot \\frac{1}{1+\\text{vol}}, f_{\\max}\\right)$$
-
-### 🎯 Stratégie recommandée
-
-| Type de pari | Quand l'utiliser | Risque |
-|---|---|---|
-| **Gagnant (value)** | Ratio > 1.20 ET cote > 2.5 | 🟡 Moyen |
-| **Placé** | Champion avec cote ≥ 4 | 🟢 Faible |
-| **Couplé Placé** | ROI > 50% | 🟡 Moyen |
-| **Trio désordre** | ROI > 100% sur 3 favoris | 🟠 Élevé |
-| **Quinté+** | Mise faible, ROI espéré > 200% | 🔴 Très élevé |
-
-### ⚠️ Avertissements
-
-- 🎰 **Les performances passées ne préjugent pas des résultats futurs**
-- 💸 **Jouez avec modération** — ne misez jamais plus que ce que vous pouvez perdre
-- 📊 Le modèle nécessite un marché suffisamment liquide pour le Benter Blend
-- 🐎 La corde au Trot n'est pertinente qu'en départ **AUTOSTART**
-- 🔍 Les statistiques empiriques sont des **valeurs indicatives basées sur des études publiques** ; affinez-les selon votre propre base de données.
-
-### 📖 Références
-
-- Benter, W. (1994). *Computer Based Horse Race Handicapping and Wagering Systems.*
-- Harville, D. (1973). *Assigning Probabilities to the Outcomes of Multi-Entry Competitions.*
-- Kelly, J. L. (1956). *A New Interpretation of Information Rate.*
-- Snowberg & Wolfers (2010). *Explaining the Favorite-Longshot Bias.*
-        """)
-
-
-if __name__ == "__main__":
-    main()

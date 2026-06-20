@@ -1459,3 +1459,57 @@ def main():
 ## 🎓 Méthodologie QuantTurf v4.0.1
 
 ### 🔬 Architecture du moteur
+
+
+### 📚 Formules clés (nouveautés)
+
+**Momentum** :  
+$$\\text{momentum} = \\bar{x}_{\\text{ancien}} - \\bar{x}_{\\text{récent}}$$  
+(positif = progression)
+
+**Entropie de la course** :  
+$$H = -\\sum p_i \\log p_i$$  
+$$\\text{penalty}_{\\text{Kelly}} = 1 + \\frac{H}{\\log N}$$
+
+**Benter 3D** :  
+$$p_{\\text{finale}} \\propto p_{\\text{modèle}}^\\alpha \\cdot p_{\\text{marché}}^\\beta \\cdot p_{\\text{empirique}}^\\gamma$$
+
+**Filtre Value renforcé** :  
+- Ratio ≥ seuil  
+- Edge > 0.03  
+- Probabilité modèle ≥ 5%
+
+**Monte Carlo adaptatif** :  
+- Écart entre les deux favoris > 12% → bruit faible (0.12)  
+- Entre 8% et 12% → bruit modéré (0.15)  
+- Sinon → bruit fort (0.22) + 50% de simulations
+
+### 🎯 Stratégie recommandée
+
+| Type de pari | Quand l'utiliser | Risque |
+|---|---|---|
+| **Gagnant (value)** | Ratio > 1.20 ET cote > 2.5 | 🟡 Moyen |
+| **Placé** | Champion avec cote ≥ 4 | 🟢 Faible |
+| **Couplé Placé** | ROI > 50% | 🟡 Moyen |
+| **Trio désordre** | ROI > 100% sur 3 favoris | 🟠 Élevé |
+| **Quinté+** | Mise faible, ROI espéré > 200% | 🔴 Très élevé |
+
+### ⚠️ Avertissements
+
+- 🎰 **Les performances passées ne préjugent pas des résultats futurs**
+- 💸 **Jouez avec modération** — ne misez jamais plus que ce que vous pouvez perdre
+- 📊 Le modèle nécessite un marché suffisamment liquide pour le Benter Blend
+- 🐎 La corde au Trot n'est pertinente qu'en départ **AUTOSTART**
+- 🔍 Les statistiques empiriques sont des **valeurs indicatives basées sur des études publiques** ; affinez-les selon votre propre base de données.
+
+### 📖 Références
+
+- Benter, W. (1994). *Computer Based Horse Race Handicapping and Wagering Systems.*
+- Harville, D. (1973). *Assigning Probabilities to the Outcomes of Multi-Entry Competitions.*
+- Kelly, J. L. (1956). *A New Interpretation of Information Rate.*
+- Snowberg & Wolfers (2010). *Explaining the Favorite-Longshot Bias.*
+        """)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,502 +1,300 @@
+# -*- coding: utf-8 -*-
 """
-Streamlit App — Prédicteur de suite logique
-Charge un fichier Excel contenant une suite de chiffres, détecte des patterns,
-et prédit les 5 prochaines valeurs.
+Application Streamlit de pronostics hippiques
+=============================================
+Scrape une course depuis Geny.fr, calcule des probabilités de victoire
+selon un modèle pondéré, et affiche les résultats.
+
+Dépendances : streamlit, requests, beautifulsoup4, pandas, numpy
+Installation : pip install -r requirements.txt
+Lancement : streamlit run app.py
 """
 
-import io
-from typing import List, Tuple, Dict, Optional
-
-import numpy as np
-import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import PolynomialFeatures
+import requests
+from bs4 import BeautifulSoup
+import re
+import pandas as pd
+import numpy as np
+import logging
 
+# ---------- Module SCRAPER (intégré) ----------
+logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------
-st.set_page_config(
-    page_title="Prédicteur de suite logique",
-    page_icon="🔢",
-    layout="wide",
-)
-
-N_PREDICT = 5  # nombre de valeurs à prédire
-
-
-# ==================================================================
-# 1. LECTURE DU FICHIER EXCEL
-# ==================================================================
-def load_sequence_from_excel(file, sheet_name=0, column=None) -> List[float]:
-    """Lit un fichier Excel et renvoie une liste de nombres."""
-    df = pd.read_excel(file, sheet_name=sheet_name, header=None)
-
-    # Si l'utilisateur a précisé une colonne
-    if column is not None and column in df.columns:
-        series = df[column]
-    else:
-        # On prend la première colonne contenant des nombres
-        numeric_df = df.apply(pd.to_numeric, errors="coerce")
-        # Choisir la colonne avec le plus de valeurs numériques
-        col_scores = numeric_df.notna().sum()
-        best_col = col_scores.idxmax()
-        series = numeric_df[best_col]
-
-    values = pd.to_numeric(series, errors="coerce").dropna().tolist()
-    return [float(v) for v in values]
-
-
-# ==================================================================
-# 2. DÉTECTEURS DE PATTERNS
-# ==================================================================
-def detect_arithmetic(seq: List[float]) -> Optional[Dict]:
-    """Suite arithmétique : u(n+1) = u(n) + r"""
-    if len(seq) < 3:
-        return None
-    diffs = np.diff(seq)
-    if np.allclose(diffs, diffs[0], atol=1e-6):
-        r = float(diffs[0])
-        preds = [seq[-1] + r * (i + 1) for i in range(N_PREDICT)]
-        return {
-            "name": "Arithmétique",
-            "formula": f"u(n+1) = u(n) + {r:g}",
-            "predictions": preds,
-            "confidence": 1.0,
-        }
-    return None
-
-
-def detect_geometric(seq: List[float]) -> Optional[Dict]:
-    """Suite géométrique : u(n+1) = u(n) * q"""
-    if len(seq) < 3 or any(v == 0 for v in seq[:-1]):
-        return None
-    ratios = np.array(seq[1:]) / np.array(seq[:-1])
-    if np.allclose(ratios, ratios[0], atol=1e-6):
-        q = float(ratios[0])
-        preds = [seq[-1] * (q ** (i + 1)) for i in range(N_PREDICT)]
-        return {
-            "name": "Géométrique",
-            "formula": f"u(n+1) = u(n) × {q:g}",
-            "predictions": preds,
-            "confidence": 1.0,
-        }
-    return None
-
-
-def detect_fibonacci_like(seq: List[float]) -> Optional[Dict]:
-    """Suite de type Fibonacci : u(n) = u(n-1) + u(n-2)"""
-    if len(seq) < 4:
-        return None
-    ok = all(
-        abs(seq[i] - (seq[i - 1] + seq[i - 2])) < 1e-6
-        for i in range(2, len(seq))
-    )
-    if ok:
-        preds = []
-        a, b = seq[-2], seq[-1]
-        for _ in range(N_PREDICT):
-            nxt = a + b
-            preds.append(nxt)
-            a, b = b, nxt
-        return {
-            "name": "Fibonacci-like",
-            "formula": "u(n) = u(n-1) + u(n-2)",
-            "predictions": preds,
-            "confidence": 1.0,
-        }
-    return None
-
-
-def detect_polynomial(seq: List[float], max_degree: int = 4) -> Optional[Dict]:
+def scrape_race(url):
     """
-    Régression polynomiale : cherche le degré minimal qui fitte parfaitement (ou presque).
+    Extrait les données d'une course depuis une URL geny.fr.
+    Retourne un dictionnaire avec les métadonnées et la liste des participants.
+    Chaque participant contient : numero, cheval, jockey, cote, poids, age, performances.
     """
-    if len(seq) < 3:
-        return None
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Erreur réseau : {e}")
 
-    x = np.arange(len(seq)).reshape(-1, 1)
-    y = np.array(seq)
+    soup = BeautifulSoup(response.text, 'html.parser')
 
-    best = None
-    for deg in range(1, min(max_degree, len(seq) - 1) + 1):
-        poly = PolynomialFeatures(degree=deg)
-        X_poly = poly.fit_transform(x)
-        model = LinearRegression().fit(X_poly, y)
-        y_pred = model.predict(X_poly)
-        mse = float(np.mean((y - y_pred) ** 2))
-        rel_err = mse / (np.var(y) + 1e-9)
+    # --- Recherche des participants ---
+    participants = []
+    # Sélecteurs possibles (à ajuster si la structure change)
+    selectors = [
+        'div.participant', 'div.partant', 'div.horse-item',
+        'tr.participant', 'tr.line', 'div.item-participant'
+    ]
 
-        if best is None or rel_err < best["rel_err"]:
-            # Prédictions
-            x_future = np.arange(len(seq), len(seq) + N_PREDICT).reshape(-1, 1)
-            X_future_poly = poly.fit_transform(x_future)
-            preds = model.predict(X_future_poly).tolist()
+    found = False
+    for selector in selectors:
+        items = soup.select(selector)
+        if items:
+            found = True
+            for item in items:
+                participant = extract_participant(item)
+                if participant:
+                    participants.append(participant)
+            break  # on garde le premier sélecteur qui fonctionne
 
-            coeffs = model.coef_
-            intercept = model.intercept_
-            formula = f"P(n) polynôme degré {deg}"
-            best = {
-                "name": f"Polynomial (degré {deg})",
-                "formula": formula,
-                "predictions": preds,
-                "confidence": max(0.0, 1.0 - rel_err),
-                "rel_err": rel_err,
-                "degree": deg,
-            }
-            # Si on a trouvé un fit quasi-parfait, on s'arrête
-            if rel_err < 1e-8:
+    if not found:
+        # Fallback : chercher toutes les lignes de tableau avec assez de cellules
+        tables = soup.find_all('table')
+        for table in tables:
+            rows = table.find_all('tr')
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) >= 4:
+                    # On tente d'extraire un nom de cheval (présence de lettres)
+                    text = ' '.join([c.get_text(strip=True) for c in cells])
+                    if re.search(r'[A-Za-z]', text):
+                        participant = extract_participant_from_row(row)
+                        if participant:
+                            participants.append(participant)
+            if participants:
                 break
 
-    if best is not None:
-        best.pop("rel_err", None)
-        return best
-    return None
+    if not participants:
+        raise Exception("Aucun participant trouvé. La structure HTML a peut-être changé.")
 
+    # --- Métadonnées de la course ---
+    metadata = {}
+    info_elem = soup.find('div', class_=re.compile(r'info-course|race-info|header-course'))
+    if info_elem:
+        text = info_elem.get_text(separator=' ', strip=True)
+        distance_match = re.search(r'(\d+)\s*m', text)
+        if distance_match:
+            metadata['distance'] = distance_match.group(1) + ' m'
+        terrain_match = re.search(r'Terrain\s*[:.]?\s*(\w+)', text, re.IGNORECASE)
+        if terrain_match:
+            metadata['terrain'] = terrain_match.group(1)
+    else:
+        metadata = {'distance': 'Non disponible', 'terrain': 'Non disponible'}
 
-def detect_diff_recurrence(seq: List[float]) -> Optional[Dict]:
-    """
-    Détecte une régularité dans les différences d'ordre supérieur
-    (utile pour des suites du type 1, 4, 9, 16, 25 → diffs de diffs constantes).
-    """
-    if len(seq) < 4:
-        return None
-    arr = np.array(seq, dtype=float)
-    diffs = arr.copy()
-    for order in range(1, min(5, len(seq) - 1)):
-        diffs = np.diff(diffs)
-        if len(diffs) >= 2 and np.allclose(diffs, diffs[0], atol=1e-6):
-            # Reconstruire vers l'avant en gardant les différences d'ordre `order` constantes
-            preds = []
-            # État courant = derniers termes de chaque niveau de différences
-            levels = [arr.tolist()]
-            tmp = arr.copy()
-            for _ in range(order):
-                tmp = np.diff(tmp)
-                levels.append(tmp.tolist())
-            const = float(diffs[0])
-            for _ in range(N_PREDICT):
-                # Étend le dernier niveau avec la constante
-                levels[-1].append(const)
-                # Remonte
-                for lvl in range(len(levels) - 2, -1, -1):
-                    levels[lvl].append(levels[lvl][-1] + levels[lvl + 1][-1])
-                preds.append(levels[0][-1])
-            return {
-                "name": f"Différences d'ordre {order} constantes",
-                "formula": f"Δ^{order} = {const:g}",
-                "predictions": preds,
-                "confidence": 0.95,
-            }
-    return None
-
-
-def detect_linear_recurrence(seq: List[float], max_order: int = 3) -> Optional[Dict]:
-    """
-    Détecte une récurrence linéaire à coefficients constants :
-        u(n) = a1*u(n-1) + a2*u(n-2) + ... + ak*u(n-k) + b
-    """
-    n = len(seq)
-    if n < 6:
-        return None
-
-    best = None
-    for k in range(1, min(max_order, n // 2) + 1):
-        # Construit le système : y = X @ [a1, ..., ak, b]
-        X = []
-        y = []
-        for i in range(k, n):
-            X.append(seq[i - k:i][::-1] + [1.0])
-            y.append(seq[i])
-        X = np.array(X)
-        y = np.array(y)
-        if X.shape[0] < X.shape[1]:
-            continue
-        # Moindres carrés
-        try:
-            coefs, *_ = np.linalg.lstsq(X, y, rcond=None)
-        except np.linalg.LinAlgError:
-            continue
-        y_pred = X @ coefs
-        mse = float(np.mean((y - y_pred) ** 2))
-        rel_err = mse / (np.var(y) + 1e-9)
-
-        if rel_err < 1e-6 and (best is None or rel_err < best["rel_err"]):
-            a = coefs[:-1]
-            b = float(coefs[-1])
-            preds = []
-            history = list(seq)
-            for _ in range(N_PREDICT):
-                nxt = float(np.dot(a, history[-k:][::-1]) + b)
-                preds.append(nxt)
-                history.append(nxt)
-            formula = " + ".join(
-                [f"{a[j]:.4g}·u(n-{j+1})" for j in range(k)]
-            )
-            if abs(b) > 1e-9:
-                formula += f" + {b:.4g}"
-            best = {
-                "name": f"Récurrence linéaire (ordre {k})",
-                "formula": f"u(n) = {formula}",
-                "predictions": preds,
-                "confidence": max(0.0, 1.0 - rel_err),
-                "rel_err": rel_err,
-            }
-
-    if best is not None:
-        best.pop("rel_err", None)
-        return best
-    return None
-
-
-def ml_fallback(seq: List[float]) -> Dict:
-    """
-    Fallback : régression polynomiale de meilleur degré (basé sur validation simple).
-    Toujours retourne un résultat.
-    """
-    n = len(seq)
-    x = np.arange(n).reshape(-1, 1)
-    y = np.array(seq)
-
-    best_deg = 1
-    best_mse = float("inf")
-    # Validation : on garde les 20% derniers points pour évaluer
-    split = max(2, int(n * 0.8))
-    x_train, y_train = x[:split], y[:split]
-    x_val, y_val = x[split:], y[split:]
-
-    for deg in range(1, min(5, n - 1) + 1):
-        poly = PolynomialFeatures(degree=deg)
-        X_train = poly.fit_transform(x_train)
-        model = LinearRegression().fit(X_train, y_train)
-        if len(x_val) > 0:
-            X_val = poly.fit_transform(x_val)
-            pred_val = model.predict(X_val)
-            mse = float(np.mean((y_val - pred_val) ** 2))
-        else:
-            mse = float(np.mean((y_train - model.predict(X_train)) ** 2))
-        if mse < best_mse:
-            best_mse = mse
-            best_deg = deg
-
-    poly = PolynomialFeatures(degree=best_deg)
-    X_full = poly.fit_transform(x)
-    model = LinearRegression().fit(X_full, y)
-    x_future = np.arange(n, n + N_PREDICT).reshape(-1, 1)
-    preds = model.predict(poly.fit_transform(x_future)).tolist()
-
-    rel_err = best_mse / (np.var(y) + 1e-9)
     return {
-        "name": f"ML — Régression polynomiale (degré {best_deg})",
-        "formula": f"Modèle polynomial degré {best_deg} (fallback)",
-        "predictions": preds,
-        "confidence": max(0.0, 1.0 - rel_err),
+        'metadata': metadata,
+        'participants': participants
     }
 
 
-# ==================================================================
-# 3. ORCHESTRATEUR
-# ==================================================================
-def analyze_sequence(seq: List[float]) -> Tuple[Dict, List[Dict]]:
+def extract_participant(item):
+    """Extrait les données d'un participant à partir d'un élément BeautifulSoup."""
+    def get_text(elem, selector):
+        el = elem.select_one(selector)
+        return el.get_text(strip=True) if el else ''
+
+    def get_float(elem, selector):
+        text = get_text(elem, selector)
+        try:
+            return float(text.replace(',', '.'))
+        except:
+            return None
+
+    num = get_text(item, '.number, .num, .dossard')
+    horse = get_text(item, '.horse, .cheval, .name')
+    jockey = get_text(item, '.jockey, .driver')
+    odds = get_float(item, '.odds, .cote, .ratio')
+    weight = get_text(item, '.weight, .poids')
+    age = get_text(item, '.age, .sex')
+    perf = get_text(item, '.performance, .recent, .forme')
+
+    # Si on n'a pas de nom de cheval, on ignore
+    if not horse:
+        return None
+
+    return {
+        'numero': num,
+        'cheval': horse,
+        'jockey': jockey,
+        'cote': odds,
+        'poids': weight,
+        'age': age,
+        'performances': perf
+    }
+
+
+def extract_participant_from_row(row):
+    """Extrait les données d'une ligne de tableau (fallback)."""
+    cells = row.find_all('td')
+    if len(cells) < 4:
+        return None
+    texts = [c.get_text(strip=True) for c in cells]
+    # On suppose que le cheval est une cellule contenant des lettres
+    horse_idx = None
+    for i, t in enumerate(texts):
+        if re.search(r'[A-Za-z]', t) and not re.search(r'\d', t):
+            horse_idx = i
+            break
+    if horse_idx is None:
+        return None
+
+    horse = texts[horse_idx]
+    num = texts[0] if len(texts) > 0 else ''
+    jockey = texts[horse_idx+1] if horse_idx+1 < len(texts) else ''
+    # Essayer de trouver la cote (un nombre flottant)
+    odds = None
+    for t in texts:
+        try:
+            odds = float(t.replace(',', '.'))
+            break
+        except:
+            pass
+    weight = ''
+    age = ''
+    perf = ''
+    for t in texts:
+        if re.search(r'\d+[pP]?\s*\d+', t):
+            perf = t
+            break
+    return {
+        'numero': num,
+        'cheval': horse,
+        'jockey': jockey,
+        'cote': odds,
+        'poids': weight,
+        'age': age,
+        'performances': perf
+    }
+
+
+# ---------- Module ANALYSIS (intégré) ----------
+def compute_probabilities(race_data):
     """
-    Applique tous les détecteurs, retourne (meilleur_pattern, tous_les_patterns).
-    Ordre de priorité : arithmétique > géométrique > fibonacci > diff. constantes
-    > récurrence linéaire > polynomial > ML fallback.
+    Calcule les probabilités de victoire pour chaque cheval selon une
+    pondération multi‑facteurs transparente :
+      - Cote du marché (probabilité implicite) → poids 0.5
+      - Forme récente (moyenne des places) → poids 0.3
+      - Poids (plus il est bas, mieux c'est) → poids 0.2
+    Les scores sont normalisés pour que la somme des probabilités = 1.
     """
-    candidates = []
-    detectors = [
-        detect_arithmetic,
-        detect_geometric,
-        detect_fibonacci_like,
-        detect_diff_recurrence,
-        detect_linear_recurrence,
-        detect_polynomial,
-    ]
-    for det in detectors:
-        try:
-            res = det(seq)
-            if res is not None:
-                candidates.append(res)
-        except Exception as e:
-            candidates.append({
-                "name": det.__name__,
-                "error": str(e),
-                "confidence": 0.0,
-                "predictions": [],
-                "formula": "",
-            })
+    participants = race_data['participants']
+    if not participants:
+        return pd.DataFrame()
 
-    # Toujours ajouter le fallback ML
-    candidates.append(ml_fallback(seq))
+    df = pd.DataFrame(participants)
 
-    # Meilleur = plus haute confiance
-    valid = [c for c in candidates if c.get("predictions")]
-    best = max(valid, key=lambda c: c.get("confidence", 0.0))
-    return best, candidates
+    # ---------- 1. Probabilité implicite par la cote ----------
+    cotes = df['cote'].astype(float)
+    cotes.fillna(cotes.mean(), inplace=True)
+    cotes = cotes.clip(lower=0.1)          # éviter division par zéro
+    prob_cote = 1.0 / cotes
+    prob_cote = prob_cote / prob_cote.sum()  # normalisation
+
+    # ---------- 2. Score de forme récente ----------
+    def forme_score(perf_str):
+        if pd.isna(perf_str) or perf_str == '':
+            return np.nan
+        numbers = re.findall(r'\d+', perf_str)
+        if not numbers:
+            return np.nan
+        places = [int(n) for n in numbers]
+        mean_place = np.mean(places)
+        max_place = 20
+        score = 1 - (mean_place - 1) / (max_place - 1)
+        return np.clip(score, 0, 1)
+
+    df['forme_score'] = df['performances'].apply(forme_score)
+    df['forme_score'].fillna(df['forme_score'].mean(), inplace=True)
+
+    # ---------- 3. Score lié au poids ----------
+    def poids_score(weight_str):
+        if pd.isna(weight_str) or weight_str == '':
+            return np.nan
+        numbers = re.findall(r'\d+', weight_str)
+        if not numbers:
+            return np.nan
+        weight = float(numbers[0])
+        min_w, max_w = 50, 70
+        score = (max_w - weight) / (max_w - min_w)
+        return np.clip(score, 0, 1)
+
+    df['poids_score'] = df['poids'].apply(poids_score)
+    df['poids_score'].fillna(df['poids_score'].mean(), inplace=True)
+
+    # ---------- 4. Agrégation pondérée ----------
+    forme_norm = df['forme_score'] / df['forme_score'].sum()
+    poids_norm = df['poids_score'] / df['poids_score'].sum()
+
+    weights = {'cote': 0.5, 'forme': 0.3, 'poids': 0.2}
+    df['score'] = (weights['cote'] * prob_cote +
+                   weights['forme'] * forme_norm +
+                   weights['poids'] * poids_norm)
+
+    df['probabilite'] = df['score'] / df['score'].sum()
+
+    result = df[['cheval', 'probabilite', 'cote', 'jockey', 'performances']].copy()
+    result['probabilite'] = result['probabilite'].round(4)
+    return result
 
 
-# ==================================================================
-# 4. INTERFACE STREAMLIT
-# ==================================================================
-def main():
-    st.title("🔢 Prédicteur de suite logique")
-    st.markdown(
-        "Charge un fichier **Excel** contenant une suite de chiffres. "
-        "L'app détecte le pattern (arithmétique, géométrique, Fibonacci, "
-        "polynomial, récurrence linéaire, ML) et prédit les **5 prochains chiffres**."
-    )
+# ---------- Application Streamlit ----------
+st.set_page_config(page_title="Pronostics Hippiques", layout="wide")
+st.title("🏇 Analyse de course hippique - Pronostics probabilistes")
 
-    # ---- Sidebar ----
-    with st.sidebar:
-        st.header("⚙️ Options")
-        show_all = st.checkbox("Afficher tous les patterns testés", value=True)
-        st.markdown("---")
-        st.markdown(
-            "**Format attendu du fichier Excel :**\n\n"
-            "Une colonne contenant des nombres (avec ou sans en-tête). "
-            "L'app détecte automatiquement la colonne numérique."
-        )
+# Cache pour éviter de rescraper la même course
+@st.cache_data(ttl=3600)
+def load_race_data(url):
+    return scrape_race(url)
 
-    # ---- Upload ----
-    uploaded = st.file_uploader(
-        "📂 Dépose ton fichier Excel (.xlsx / .xls)",
-        type=["xlsx", "xls"],
-    )
+# Interface
+url = st.text_input("Entrez l'URL de la course Geny.fr :",
+                    placeholder="https://www.geny.fr/...")
 
-    # Option : saisie manuelle pour tester
-    with st.expander("Ou saisir une suite manuellement (test rapide)"):
-        manual = st.text_input(
-            "Ex : 2, 4, 6, 8, 10",
-            value="",
-            help="Entre des nombres séparés par des virgules ou des espaces.",
-        )
-
-    sequence = None
-
-    if uploaded is not None:
-        try:
-            sequence = load_sequence_from_excel(uploaded)
-            st.success(f"✅ Fichier chargé — {len(sequence)} valeurs détectées.")
-        except Exception as e:
-            st.error(f"❌ Erreur de lecture du fichier : {e}")
-
-    elif manual.strip():
-        try:
-            raw = manual.replace(",", " ").split()
-            sequence = [float(x) for x in raw if x.strip()]
-            st.info(f"ℹ️ Suite manuelle : {len(sequence)} valeurs.")
-        except ValueError:
-            st.error("❌ Format invalide. Utilise des nombres séparés par des virgules ou espaces.")
-
-    if sequence is None:
-        st.stop()
-
-    if len(sequence) < 3:
-        st.warning("⚠️ Il faut au moins 3 valeurs pour détecter un pattern.")
-        st.stop()
-
-    # ---- Affichage de la suite ----
-    st.subheader("📊 Suite d'entrée")
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        df_in = pd.DataFrame({"n": range(len(sequence)), "u(n)": sequence})
-        st.dataframe(df_in, use_container_width=True, height=200)
-    with col2:
-        st.metric("Nombre de valeurs", len(sequence))
-        st.metric("Min", f"{min(sequence):g}")
-        st.metric("Max", f"{max(sequence):g}")
-
-    # ---- Analyse ----
-    with st.spinner("🔍 Recherche du meilleur pattern..."):
-        best, all_patterns = analyze_sequence(sequence)
-
-    # ---- Résultat principal ----
-    st.subheader("🎯 Prédiction des 5 prochains chiffres")
-    st.markdown(f"**Pattern retenu :** `{best['name']}`")
-    st.markdown(f"**Formule :** `{best['formula']}`")
-    st.markdown(f"**Confiance :** `{best.get('confidence', 0):.2%}`")
-
-    preds = best["predictions"]
-    # Arrondi propre si les entrées sont entières
-    all_int = all(float(v).is_integer() for v in sequence)
-    if all_int:
-        display_preds = [int(round(p)) for p in preds]
+if st.button("🔍 Analyser la course"):
+    if not url:
+        st.error("Veuillez entrer une URL.")
     else:
-        display_preds = [round(p, 4) for p in preds]
-
-    st.success("**Suite prédite :** " + " → ".join(str(v) for v in display_preds))
-
-    pred_df = pd.DataFrame({
-        "Rang": [f"u({len(sequence) + i})" for i in range(N_PREDICT)],
-        "Valeur prédite": display_preds,
-    })
-    st.table(pred_df)
-
-    # ---- Graphique ----
-    st.subheader("📈 Visualisation")
-    fig, ax = plt.subplots(figsize=(10, 4))
-    x_in = list(range(len(sequence)))
-    x_pred = list(range(len(sequence), len(sequence) + N_PREDICT))
-    ax.plot(x_in, sequence, "o-", label="Suite fournie", color="#1f77b4")
-    ax.plot(x_pred, preds, "s--", label="Prédiction (5 valeurs)", color="#d62728")
-    ax.axvline(len(sequence) - 0.5, color="gray", ls=":", alpha=0.5)
-    ax.set_xlabel("n")
-    ax.set_ylabel("u(n)")
-    ax.legend()
-    ax.grid(alpha=0.3)
-    st.pyplot(fig)
-
-    # ---- Tous les patterns testés ----
-    if show_all:
-        st.subheader("🧪 Tous les patterns testés")
-        rows = []
-        for p in all_patterns:
-            if "error" in p:
-                rows.append({
-                    "Pattern": p["name"],
-                    "Formule": f"❌ {p['error']}",
-                    "Confiance": "-",
-                    "Prédictions": "-",
-                })
-            else:
-                preds_p = p.get("predictions", [])
-                if all_int and preds_p:
-                    preds_p = [int(round(v)) for v in preds_p]
+        with st.spinner("Scraping et analyse en cours..."):
+            try:
+                race_data = load_race_data(url)
+                participants = race_data.get('participants', [])
+                if not participants:
+                    st.error("Aucun participant trouvé. Vérifiez l'URL ou la structure de la page.")
                 else:
-                    preds_p = [round(v, 3) for v in preds_p]
-                rows.append({
-                    "Pattern": p["name"],
-                    "Formule": p.get("formula", ""),
-                    "Confiance": f"{p.get('confidence', 0):.2%}",
-                    "Prédictions": ", ".join(str(v) for v in preds_p),
-                })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    prob_df = compute_probabilities(race_data)
+                    if prob_df.empty:
+                        st.error("Impossible de calculer les probabilités.")
+                    else:
+                        st.success("✅ Analyse terminée !")
 
-    # ---- Export ----
-    st.subheader("💾 Exporter les résultats")
-    export_df = pd.concat([
-        pd.DataFrame({"n": range(len(sequence)), "valeur": sequence, "type": "input"}),
-        pd.DataFrame({
-            "n": range(len(sequence), len(sequence) + N_PREDICT),
-            "valeur": display_preds,
-            "type": "prediction",
-        }),
-    ], ignore_index=True)
+                        meta = race_data.get('metadata', {})
+                        if meta:
+                            col1, col2 = st.columns(2)
+                            col1.metric("Distance", meta.get('distance', 'N/A'))
+                            col2.metric("Terrain", meta.get('terrain', 'N/A'))
 
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        export_df.to_excel(writer, index=False, sheet_name="Résultat")
-    buf.seek(0)
+                        st.subheader("📊 Classement des chevaux par probabilité de victoire")
+                        display_df = prob_df.sort_values('probabilite', ascending=False)
+                        display_df['probabilite'] = display_df['probabilite'].apply(lambda x: f"{x*100:.1f}%")
+                        st.dataframe(display_df, use_container_width=True)
 
-    st.download_button(
-        label="📥 Télécharger le résultat en Excel",
-        data=buf,
-        file_name="prediction_suite.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+                        st.subheader("📈 Distribution des probabilités")
+                        chart_data = display_df.set_index('cheval')['probabilite']
+                        chart_data = chart_data.str.rstrip('%').astype(float)
+                        st.bar_chart(chart_data)
 
+                        with st.expander("🔎 Voir les données brutes extraites"):
+                            st.json(race_data)
 
-if __name__ == "__main__":
-    main()
+            except Exception as e:
+                st.error(f"❌ Une erreur est survenue : {str(e)}")

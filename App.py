@@ -35,7 +35,7 @@ OVERPASS_URLS = [
 ]
 
 # Remplacez par votre véritable adresse email (obligatoire pour Nominatim)
-USER_AGENT = "TripPlanner/1.0 (monadresse@example.com)"
+USER_AGENT = "TripPlanner/1.0 (lufy1285@gmail.com)"
 TIMEOUT = 20
 OVERPASS_TIMEOUT = 30
 

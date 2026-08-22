@@ -2,7 +2,7 @@
 TripPlanner – Meilleure combinaison transport + hébergement
 Application Streamlit autonome (un seul fichier).
 Recherche en temps réel sur Internet :
-- Géocodage via Nominatim (OpenStreetMap)
+- Géocodage via Nominatim (avec repli Photon)
 - Itinéraires routiers via OSRM (serveur public)
 - Hébergements via Overpass API (OpenStreetMap)
 Les tarifs transport/hébergement sont des estimations réalistes.
@@ -11,8 +11,8 @@ Les tarifs transport/hébergement sont des estimations réalistes.
 import math
 import random
 import re
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from dataclasses import dataclass
+from typing import List, Tuple
 from datetime import date, timedelta
 
 import streamlit as st
@@ -24,9 +24,12 @@ import numpy as np
 # Configuration
 # ----------------------------------------------------------------------
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+PHOTON_URL = "https://photon.komoot.io/api/"
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-USER_AGENT = "TripPlanner/1.0 (contact@example.com)"
+
+# Remplacez par votre véritable adresse email (obligatoire pour Nominatim)
+USER_AGENT = "TripPlanner/1.0 (monadresse@example.com)"
 TIMEOUT = 20
 OVERPASS_TIMEOUT = 40
 
@@ -74,18 +77,20 @@ class TripOption:
     reasons: List[str]
 
 # ----------------------------------------------------------------------
-# Services géocodage / itinéraires
+# Géocodage (Nominatim + repli Photon)
 # ----------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def geocode(city: str) -> Location:
-    """Géolocalise une ville via Nominatim."""
+def _geocode_nominatim(city: str) -> Location:
+    """Géocodage via Nominatim."""
     params = {
         "q": city,
         "format": "json",
         "limit": 1,
         "addressdetails": 1,
     }
-    headers = {"User-Agent": USER_AGENT}
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "fr",
+    }
     resp = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=TIMEOUT)
     resp.raise_for_status()
     data = resp.json()
@@ -99,6 +104,48 @@ def geocode(city: str) -> Location:
         display_name=item.get("display_name", city),
     )
 
+def _geocode_photon(city: str) -> Location:
+    """Géocodage via Photon (repli si Nominatim échoue)."""
+    params = {
+        "q": city,
+        "limit": 1,
+    }
+    resp = requests.get(PHOTON_URL, params=params, timeout=TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    features = data.get("features", [])
+    if not features:
+        raise ValueError(f"Lieu introuvable : {city}")
+    feature = features[0]
+    coords = feature["geometry"]["coordinates"]
+    props = feature["properties"]
+    return Location(
+        name=city,
+        lat=coords[1],
+        lon=coords[0],
+        display_name=props.get("name", city) + ", " + props.get("country", ""),
+    )
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode(city: str) -> Location:
+    """
+    Géolocalise une ville, en essayant d'abord Nominatim puis Photon.
+    """
+    try:
+        return _geocode_nominatim(city)
+    except Exception as e:
+        # Si Nominatim échoue (403, 500, etc.), on tente Photon
+        try:
+            return _geocode_photon(city)
+        except Exception as e2:
+            raise ValueError(
+                f"Impossible de géolocaliser '{city}' avec les services disponibles. "
+                f"Erreur Nominatim : {e} ; Erreur Photon : {e2}"
+            )
+
+# ----------------------------------------------------------------------
+# Itinéraires routiers (OSRM)
+# ----------------------------------------------------------------------
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_route_km_duration(lat1: float, lon1: float, lat2: float, lon2: float):
     """Calcule distance routière (km) et durée (min) via OSRM."""
@@ -434,7 +481,7 @@ def display_trip_card(trip, nights, origin, destination):
 
 st.title("✈️ TripPlanner – Meilleure combinaison transport + hébergement")
 st.caption(
-    "Recherche en temps réel sur Internet : géocodage Nominatim, itinéraires OSRM, "
+    "Recherche en temps réel sur Internet : géocodage (Nominatim/Photon), itinéraires OSRM, "
     "hébergements OpenStreetMap. Tarifs transport/hébergement **estimés** par modèles."
 )
 
@@ -578,15 +625,15 @@ if submitted:
             st.error(f"Une erreur est survenue : {e}")
             st.info(
                 "Vérifiez votre connexion Internet et que les noms de villes sont corrects. "
-                "Les services gratuits utilisés (Nominatim, OSRM, Overpass) peuvent parfois être indisponibles."
+                "Si le problème persiste, les services gratuits utilisés peuvent être momentanément indisponibles."
             )
 
 st.sidebar.header("ℹ️ À propos des données")
 st.sidebar.markdown(
     """
-- **Géocodage** : [Nominatim](https://nominatim.org) (OpenStreetMap)
-- **Itinéraires** : [OSRM](http://project-osrm.org) (serveur public)
-- **Hébergements** : [Overpass API](https://overpass-api.de) (OpenStreetMap)
+- **Géocodage** : Nominatim (OpenStreetMap) avec repli Photon
+- **Itinéraires** : OSRM (serveur public)
+- **Hébergements** : Overpass API (OpenStreetMap)
 - **Tarifs transport** : estimations basées sur des barèmes moyens
 - **Tarifs hébergement** : estimations selon type/étoiles/proximité
 

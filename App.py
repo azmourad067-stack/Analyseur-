@@ -4,12 +4,12 @@ Application Streamlit autonome (un seul fichier).
 Recherche en temps réel sur Internet :
 - Géocodage via Nominatim (avec repli Photon)
 - Itinéraires routiers via OSRM (serveur public)
-- Hébergements via Overpass API (OpenStreetMap)
+- Hébergements via Overpass API (OpenStreetMap, avec miroirs de secours)
 Les tarifs transport/hébergement sont des estimations réalistes.
+Aucune donnée simulée n'est utilisée pour les hébergements.
 """
 
 import math
-import random
 import re
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -26,12 +26,18 @@ import numpy as np
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 PHOTON_URL = "https://photon.komoot.io/api/"
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+# Liste de miroirs Overpass (essayés dans l'ordre)
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
 
 # Remplacez par votre véritable adresse email (obligatoire pour Nominatim)
-USER_AGENT = "TripPlanner/1.0 (lufy1285@gmail.com)"
+USER_AGENT = "TripPlanner/1.0 (monadresse@example.com)"
 TIMEOUT = 20
-OVERPASS_TIMEOUT = 40
+OVERPASS_TIMEOUT = 30
 
 # ----------------------------------------------------------------------
 # Modèles de données
@@ -128,13 +134,10 @@ def _geocode_photon(city: str) -> Location:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def geocode(city: str) -> Location:
-    """
-    Géolocalise une ville, en essayant d'abord Nominatim puis Photon.
-    """
+    """Géolocalise une ville, en essayant d'abord Nominatim puis Photon."""
     try:
         return _geocode_nominatim(city)
     except Exception as e:
-        # Si Nominatim échoue (403, 500, etc.), on tente Photon
         try:
             return _geocode_photon(city)
         except Exception as e2:
@@ -213,7 +216,7 @@ def generate_transport_options(origin: Location, destination: Location, roundtri
     return options
 
 # ----------------------------------------------------------------------
-# Recherche d'hébergements via OpenStreetMap
+# Recherche d'hébergements via OpenStreetMap Overpass API
 # ----------------------------------------------------------------------
 def haversine_km(lat1, lon1, lat2, lon2):
     """Distance en km entre deux points GPS."""
@@ -253,6 +256,25 @@ def estimate_price(stars: int, acc_type: str, distance_km: float) -> float:
         price = 45 + 10 * (1 / (distance_km + 1))
         return round(price, 2)
 
+def _query_overpass(query: str, attempt: int = 0) -> dict:
+    """Envoie la requête Overpass en essayant plusieurs miroirs."""
+    if attempt >= len(OVERPASS_URLS):
+        raise RuntimeError("Tous les miroirs Overpass ont échoué.")
+    url = OVERPASS_URLS[attempt]
+    try:
+        # Utilisation de GET avec paramètre data pour éviter certains problèmes de proxy
+        resp = requests.get(
+            url,
+            params={"data": query},
+            headers={"User-Agent": USER_AGENT},
+            timeout=OVERPASS_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.warning(f"Échec du miroir Overpass {url} : {e}. Tentative suivante...")
+        return _query_overpass(query, attempt + 1)
+
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_osm_accommodations(
     lat: float,
@@ -260,7 +282,10 @@ def fetch_osm_accommodations(
     radius_km: int,
     acc_types: Tuple[str, ...],
 ) -> List[AccommodationOption]:
-    """Interroge Overpass API pour récupérer les hébergements autour du point."""
+    """
+    Interroge l'API Overpass (OpenStreetMap) pour récupérer les hébergements réels.
+    Retourne une liste vide si aucun résultat ou si le service échoue.
+    """
     statements = []
     radius_m = radius_km * 1000
 
@@ -281,13 +306,11 @@ def fetch_osm_accommodations(
 out center tags 50;
 """
 
-    headers = {"User-Agent": USER_AGENT}
     try:
-        resp = requests.post(OVERPASS_URL, data={"data": query}, headers=headers, timeout=OVERPASS_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        return _fallback_accommodations(lat, lon, radius_km, acc_types)
+        data = _query_overpass(query)
+    except Exception as e:
+        st.error(f"Erreur lors de la récupération des hébergements : {e}")
+        return []
 
     elements = data.get("elements", [])
     results = []
@@ -334,36 +357,6 @@ out center tags 50;
             )
         )
 
-    if not results:
-        return _fallback_accommodations(lat, lon, radius_km, acc_types)
-    return results
-
-def _fallback_accommodations(lat, lon, radius_km, acc_types) -> List[AccommodationOption]:
-    """Génère quelques hébergements simulés si Overpass est indisponible."""
-    results = []
-    for i in range(8):
-        angle = i * 45
-        dist = radius_km * random.uniform(0.3, 0.8)
-        acc_lat = lat + (dist / 111)
-        acc_lon = lon + (dist / (111 * math.cos(math.radians(lat))))
-        acc_type = random.choice(acc_types)
-        stars = random.randint(1, 5) if acc_type == "hotel" else 0
-        price = estimate_price(stars, acc_type, dist)
-        name = f"{acc_type.capitalize()} {i + 1} (simulé)"
-        results.append(
-            AccommodationOption(
-                name=name,
-                type=acc_type,
-                stars=stars,
-                price_per_night=price,
-                distance_km=round(dist, 2),
-                lat=acc_lat,
-                lon=acc_lon,
-                address="Adresse simulée",
-                source="Fallback (simulation)",
-                url="",
-            )
-        )
     return results
 
 # ----------------------------------------------------------------------
@@ -549,7 +542,7 @@ if submitted:
 
                 if not accommodations:
                     st.warning(
-                        "Aucun hébergement trouvé avec ces critères. "
+                        "Aucun hébergement réel trouvé avec ces critères. "
                         "Élargissez le rayon ou modifiez le filtre d'étoiles."
                     )
                 else:
@@ -633,7 +626,7 @@ st.sidebar.markdown(
     """
 - **Géocodage** : Nominatim (OpenStreetMap) avec repli Photon
 - **Itinéraires** : OSRM (serveur public)
-- **Hébergements** : Overpass API (OpenStreetMap)
+- **Hébergements** : Overpass API (OpenStreetMap, miroirs multiples)
 - **Tarifs transport** : estimations basées sur des barèmes moyens
 - **Tarifs hébergement** : estimations selon type/étoiles/proximité
 

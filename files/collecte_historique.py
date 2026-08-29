@@ -23,6 +23,11 @@ from datetime import date, timedelta
 
 import requests
 
+# Force l'affichage immédiat des print(), même quand la sortie standard n'est
+# pas un terminal interactif (certains IDE/lanceurs bufferisent sinon tout
+# jusqu'à la fin du script, donnant l'impression que "rien ne se passe").
+sys.stdout.reconfigure(line_buffering=True)
+
 API_BASE = "https://open-pmu-api.vercel.app/api/arrivees"
 DELAI_ENTRE_APPELS_SECONDES = 1.5
 TIMEOUT_SECONDES = 15
@@ -59,6 +64,7 @@ def detecter_format_date() -> str:
     deux avant de lancer la collecte, plutôt que de le découvrir 570 appels
     plus tard.
     """
+    print("Test de connexion à l'API (détection du format de date)...")
     candidats = {
         "%d/%m/%Y": DATE_TEST_DETECTION.strftime("%d/%m/%Y"),
         "%m/%d/%Y": DATE_TEST_DETECTION.strftime("%m/%d/%Y"),

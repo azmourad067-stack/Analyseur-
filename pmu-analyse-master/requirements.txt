@@ -1,4 +1,0 @@
-streamlit>=1.37,<2
-requests>=2.31,<3
-SQLAlchemy>=2.0,<3
-pandas>=2.0,<3

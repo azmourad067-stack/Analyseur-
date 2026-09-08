@@ -1,6 +1,0 @@
-streamlit==1.63.0
-pandas==2.3.3
-numpy==2.3.3
-scikit-learn==1.7.2
-supabase==2.31.0
-requests==2.32.5

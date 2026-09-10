@@ -1,3 +1,6 @@
+import math
+import os
+
 from __future__ import annotations
 
 import os
@@ -48,7 +51,68 @@ def healthcheck() -> tuple[bool, str]:
         return False, f"Supabase inaccessible : {exc}"
 
 
+def _json_safe(value):
+    """
+    Convertit les valeurs Pandas/NumPy en valeurs compatibles JSON/Supabase.
+    NaN, NaT, +inf et -inf deviennent None.
+    """
+
+    if value is None:
+        return None
+
+    # Dates Pandas
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
+        return value.isoformat()
+
+    # Valeurs manquantes Pandas / NumPy
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    # Float infini / NaN
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+
+    # Types NumPy éventuels
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+
+    # Nouvelle vérification après conversion NumPy
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+
+    return value
+
+
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """
+    Transforme un DataFrame en enregistrements JSON-safe
+    pour Supabase.
+    """
+
+    rows = df.to_dict(orient="records")
+
+    clean_rows = []
+
+    for row in rows:
+
+        clean_row = {}
+
+        for key, value in row.items():
+            clean_row[key] = _json_safe(value)
+
+        clean_rows.append(clean_row)
+
+    return clean_rows
     clean = df.copy().where(pd.notna(df), None)
     rows = clean.to_dict(orient="records")
     for row in rows:

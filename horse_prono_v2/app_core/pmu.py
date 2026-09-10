@@ -155,6 +155,8 @@ def participants_to_df(payload: Any, race_date: date, reunion: int, course: int)
         rows.append({
             "race_id": f"R{reunion}C{course}_{race_date.isoformat()}",
             "race_date": pd.Timestamp(race_date),
+            "reunion": reunion,
+            "course_number": course,
             "discipline": _pick(p, "discipline", default="INCONNU"),
             "hippodrome": _pick(payload, "hippodrome.libelleCourt", "hippodrome.nom", "reunion.hippodrome.nom", default="INCONNU"),
             "distance": _pick(payload, "distance", "course.distance", default=None),

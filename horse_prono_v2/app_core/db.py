@@ -735,35 +735,59 @@ def get_participants(
 # TRAINING HISTORY
 # ============================================================
 
-def get_training_history(
+def _get_training_history_paginated(
+    race_date: date,
     limit_rows: int = 200_000,
+    page_size: int = 1000,
 ) -> pd.DataFrame:
     """
-    Historique disponible avant aujourd'hui.
-
-    Le filtre temporel est réalisé côté PostgreSQL
-    via la fonction RPC.
+    Récupère tout l'historique via le RPC Supabase
+    en contournant la limite API de 1000 lignes
+    grâce à la pagination.
     """
 
-    response = (
-        _client()
-        .rpc(
-            "get_training_history_until",
-            {
-                "p_race_date":
-                    date.today().isoformat(),
+    all_rows: list[dict] = []
 
-                "p_limit":
-                    limit_rows,
-            },
+    start = 0
+
+    while start < limit_rows:
+
+        end = min(
+            start + page_size - 1,
+            limit_rows - 1,
         )
-        .execute()
-    )
 
-    rows = _rows(response)
+        response = (
+            _client()
+            .rpc(
+                "get_training_history_until",
+                {
+                    "p_race_date": race_date.isoformat(),
+                    "p_limit": limit_rows,
+                },
+            )
+            .range(start, end)
+            .execute()
+        )
 
-    if not rows:
+        batch = _rows(response)
 
+        if not batch:
+            break
+
+        all_rows.extend(batch)
+
+        print(
+            f"Historique Supabase : "
+            f"{len(all_rows)} lignes chargées..."
+        )
+
+        if len(batch) < page_size:
+            break
+
+        start += page_size
+
+    if not all_rows:
         return pd.DataFrame(
             columns=[
                 "race_id",
@@ -785,8 +809,19 @@ def get_training_history(
             ]
         )
 
-    return pd.DataFrame(
-        rows
+    return pd.DataFrame(all_rows)
+
+
+def get_training_history(
+    limit_rows: int = 200_000,
+) -> pd.DataFrame:
+    """
+    Historique strictement antérieur à aujourd'hui.
+    """
+
+    return _get_training_history_paginated(
+        date.today(),
+        limit_rows=limit_rows,
     )
 
 
@@ -795,29 +830,13 @@ def get_history_as_of(
     limit_rows: int = 200_000,
 ) -> pd.DataFrame:
     """
-    Historique strictement antérieur à une date.
+    Historique strictement antérieur à une date donnée.
     """
 
-    response = (
-        _client()
-        .rpc(
-            "get_training_history_until",
-            {
-                "p_race_date":
-                    race_date.isoformat(),
-
-                "p_limit":
-                    limit_rows,
-            },
-        )
-        .execute()
+    return _get_training_history_paginated(
+        race_date,
+        limit_rows=limit_rows,
     )
-
-    return pd.DataFrame(
-        _rows(response)
-    )
-
-
 # ============================================================
 # INGESTION RUNS
 # ============================================================

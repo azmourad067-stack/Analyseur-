@@ -57,12 +57,11 @@ def _as_int(value):
 
 def programme_choices(programme):
     """
-    Extrait les couples (réunion, course) depuis le programme PMU.
-
-    Structure PMU attendue :
-        programme
-          └── reunions
-                └── courses
+    Extrait les couples réunion/course depuis le programme PMU.
+    Compatible avec :
+      {"reunions": [...]}
+    et :
+      {"programme": {"reunions": [...]}}
     """
 
     choices = []
@@ -70,83 +69,68 @@ def programme_choices(programme):
     if not isinstance(programme, dict):
         return choices
 
-    # ---------------------------------------------------------
-    # 1. Structure PMU standard : reunions -> courses
-    # ---------------------------------------------------------
-    reunions = programme.get("reunions")
+    # Le JSON PMU peut être enveloppé dans une clé "programme"
+    root = programme.get("programme")
 
-    if isinstance(reunions, list):
-        for reunion_obj in reunions:
+    if not isinstance(root, dict):
+        root = programme
 
-            if not isinstance(reunion_obj, dict):
+    reunions = root.get("reunions", [])
+
+    if not isinstance(reunions, list):
+        return choices
+
+    for reunion_obj in reunions:
+
+        if not isinstance(reunion_obj, dict):
+            continue
+
+        reunion = _as_int(
+            reunion_obj.get("numOfficiel")
+            or reunion_obj.get("numReunion")
+            or reunion_obj.get("numReunionProgramme")
+        )
+
+        courses = reunion_obj.get("courses", [])
+
+        if not isinstance(courses, list):
+            continue
+
+        for course_obj in courses:
+
+            if not isinstance(course_obj, dict):
                 continue
 
-            reunion = (
-                reunion_obj.get("numOfficiel")
-                or reunion_obj.get("numReunion")
-                or reunion_obj.get("numReunionProgramme")
-                or reunion_obj.get("numOrdre")
+            # Certaines réponses donnent aussi le numéro de réunion
+            # directement dans l'objet course.
+            current_reunion = reunion or _as_int(
+                course_obj.get("numReunion")
             )
 
-            reunion = _as_int(reunion)
+            course = _as_int(
+                course_obj.get("numOrdre")
+                or course_obj.get("numCourse")
+                or course_obj.get("numOfficiel")
+            )
 
-            if reunion is None:
+            if current_reunion is None or course is None:
                 continue
 
-            courses = reunion_obj.get("courses", [])
+            choices.append({
+                "reunion": current_reunion,
+                "course": course,
+            })
 
-            if not isinstance(courses, list):
-                continue
+    # Suppression des doublons
+    unique = {
+        (x["reunion"], x["course"]): x
+        for x in choices
+    }
 
-            for course_obj in courses:
-
-                if not isinstance(course_obj, dict):
-                    continue
-
-                course = (
-                    course_obj.get("numOrdre")
-                    or course_obj.get("numCourse")
-                    or course_obj.get("numOfficiel")
-                )
-
-                course = _as_int(course)
-
-                if course is None:
-                    continue
-
-                choices.append(
-                    {
-                        "reunion": reunion,
-                        "course": course,
-                    }
-                )
-
-    # ---------------------------------------------------------
-    # 2. Suppression des doublons
-    # ---------------------------------------------------------
-    unique = {}
-
-    for item in choices:
-        key = (item["reunion"], item["course"])
-        unique[key] = item
-
-    return list(unique.values())
-
-
-def _pick(obj: dict, *paths, default=None):
-    for p in paths:
-        cur = obj
-        if isinstance(p, str):
-            p = p.split(".")
-        try:
-            for part in p:
-                cur = cur[part]
-            if cur is not None:
-                return cur
-        except Exception:
-            continue
-    return default
-
+    return sorted(
+        unique.values(),
+        key=lambda x: (x["reunion"], x["course"])
+    )
 
 def participants_to_df(payload: Any, race_date: date, reunion: int, course: int) -> pd.DataFrame:
     # PMU payload schemas vary; locate participant-like dictionaries defensively.

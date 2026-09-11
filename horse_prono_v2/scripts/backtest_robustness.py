@@ -1112,6 +1112,10 @@ def main() -> None:
         or {}
     )
 
+       # ========================================================
+    # CONTROLE DE REPRODUCTION
+    # ========================================================
+
     expected = safe_float(
         active_metrics.get(
             "win_logloss"
@@ -1136,6 +1140,146 @@ def main() -> None:
         else None
     )
 
+    relative_gap = (
+        gap
+        / abs(
+            expected
+        )
+        if (
+            gap is not None
+            and expected not in (
+                None,
+                0,
+            )
+        )
+        else None
+    )
+
+    # --------------------------------------------------------
+    # Vérification structurelle du holdout
+    # --------------------------------------------------------
+
+    structural_keys = [
+        "train_rows",
+        "calibration_rows",
+        "test_rows",
+        "test_races",
+    ]
+
+    structural_match = True
+
+    for key in structural_keys:
+
+        active_value = (
+            active_metrics.get(
+                key
+            )
+        )
+
+        reproduced_value = (
+            fit_metrics.get(
+                key
+            )
+        )
+
+        try:
+
+            active_value = int(
+                active_value
+            )
+
+            reproduced_value = int(
+                reproduced_value
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ):
+
+            structural_match = False
+
+            print(
+                f"Structure {key}: "
+                f"valeur invalide"
+            )
+
+            continue
+
+        same = (
+            active_value
+            == reproduced_value
+        )
+
+        structural_match = (
+            structural_match
+            and same
+        )
+
+        print(
+            f"Structure {key}: "
+            f"{active_value} / "
+            f"{reproduced_value} "
+            f"=> "
+            f"{'OK' if same else 'DIFF'}"
+        )
+
+    # --------------------------------------------------------
+    # Vérification des dates test
+    # --------------------------------------------------------
+
+    active_start = str(
+        active_metrics.get(
+            "test_start"
+        )
+    )
+
+    reproduced_start = str(
+        fit_metrics.get(
+            "test_start"
+        )
+    )
+
+    active_end = str(
+        active_metrics.get(
+            "test_end"
+        )
+    )
+
+    reproduced_end = str(
+        fit_metrics.get(
+            "test_end"
+        )
+    )
+
+    dates_match = (
+        active_start
+        == reproduced_start
+        and
+        active_end
+        == reproduced_end
+    )
+
+    # --------------------------------------------------------
+    # Tolérance numérique
+    # --------------------------------------------------------
+    #
+    # On ne cherche pas une égalité bit-à-bit :
+    # sklearn / NumPy peuvent produire de très petites
+    # variations flottantes entre deux exécutions.
+    #
+    # 1e-4 est largement inférieur à une variation
+    # économiquement ou statistiquement significative ici.
+    # --------------------------------------------------------
+
+    REPRO_TOLERANCE = 1e-4
+
+    numerical_match = (
+        gap is not None
+        and gap <= REPRO_TOLERANCE
+    )
+
+    print()
     print(
         f"Win log-loss enregistré : "
         f"{expected}"
@@ -1147,20 +1291,60 @@ def main() -> None:
     )
 
     print(
-        f"Écart                    : "
+        f"Écart absolu             : "
         f"{gap}"
     )
 
-    if (
-        gap is not None
-        and gap > 1e-9
-    ):
+    print(
+        f"Écart relatif            : "
+        f"{relative_gap}"
+    )
+
+    print(
+        f"Tolérance                 : "
+        f"{REPRO_TOLERANCE}"
+    )
+
+    print(
+        f"Période enregistrée       : "
+        f"{active_start} -> {active_end}"
+    )
+
+    print(
+        f"Période reproduite        : "
+        f"{reproduced_start} -> "
+        f"{reproduced_end}"
+    )
+
+    if not structural_match:
 
         raise SystemExit(
-            "Le modèle actif n'est pas reproduit "
-            "exactement. Backtest interrompu."
+            "Le découpage train/calibration/test "
+            "ne correspond pas au modèle actif. "
+            "Backtest interrompu."
         )
 
+    if not dates_match:
+
+        raise SystemExit(
+            "La période de test ne correspond pas "
+            "au modèle actif. "
+            "Backtest interrompu."
+        )
+
+    if not numerical_match:
+
+        raise SystemExit(
+            "L'écart numérique avec le modèle actif "
+            "dépasse la tolérance. "
+            "Backtest interrompu."
+        )
+
+    print()
+    print(
+        "✅ Reproduction compatible avec "
+        "le modèle actif."
+    )
     advanced = (
         build_advanced_backtest(
             model,

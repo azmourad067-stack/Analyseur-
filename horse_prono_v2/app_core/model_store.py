@@ -21,12 +21,20 @@ from .config import (
 )
 
 
-# ============================================================
-# HASH
-# ============================================================
+SCHEMA_VERSION = 6
+
+MODEL_FAMILY = (
+    "HorseProno V4.2 "
+    "production-aligned "
+    "age-sex discipline-aware"
+)
+
 
 def _artifact_hash(
-    artifact: dict[str, Any],
+    artifact: dict[
+        str,
+        Any,
+    ],
 ) -> str:
 
     payload = json.dumps(
@@ -43,13 +51,12 @@ def _artifact_hash(
     ).hexdigest()
 
 
-# ============================================================
-# SERIALISATION
-# ============================================================
-
 def _serialize_standard_scaler(
     scaler,
-) -> dict[str, Any]:
+) -> dict[
+    str,
+    Any,
+]:
 
     return {
         "mean":
@@ -62,7 +69,10 @@ def _serialize_standard_scaler(
 
 def _serialize_logistic(
     model,
-) -> dict[str, Any]:
+) -> dict[
+    str,
+    Any,
+]:
 
     return {
         "coef":
@@ -73,41 +83,57 @@ def _serialize_logistic(
     }
 
 
-def _serialize_hgb(
-    model,
-) -> dict[str, Any]:
-    """
-    HistGradientBoosting reste utilisé pour l'évaluation
-    offline mais n'est pas sérialisé dans l'artefact portable.
-    """
-
-    return {
-        "enabled":
-            False,
-
-        "reason": (
-            "Gradient Boosting retained for offline "
-            "evaluation; production artifact uses "
-            "portable Bradley-Terry + logistic models."
-        ),
-    }
-
-
 def serialize_model(
     model,
-    metrics: dict[str, Any],
-) -> dict[str, Any]:
+    metrics: dict[
+        str,
+        Any,
+    ],
+) -> dict[
+    str,
+    Any,
+]:
 
     artifact = {
 
         "schema_version":
-    5,
+            SCHEMA_VERSION,
 
-"model_family":
-    "HorseProno V4.1 age-sex discipline-aware",
+        "model_family":
+            MODEL_FAMILY,
 
         "feature_columns":
             FEATURE_COLUMNS,
+
+        "prediction_recipe": {
+
+            "win": {
+
+                "bt_weight":
+                    float(
+                        model
+                        .win_bt_weight
+                    ),
+
+                "logit_weight":
+                    float(
+                        model
+                        .win_logit_weight
+                    ),
+
+                "calibration":
+                    "platt",
+            },
+
+            "place": {
+
+                "model":
+                    "logistic",
+
+                "calibration":
+                    "platt",
+            },
+        },
 
         "scaler":
             _serialize_standard_scaler(
@@ -151,21 +177,23 @@ def serialize_model(
             model.config.__dict__,
 
         "algorithms": [
-            "Bradley-Terry",
-            "LogisticRegression L2",
-            "GradientBoosting challenger offline",
-            "Platt calibration",
-            "Discipline-aware interactions",
+            "Bradley-Terry production",
+            "LogisticRegression L2 production",
+            "Platt calibration on production blend",
+            "HistGradientBoosting challenger offline only",
+            "Age-sex-discipline interactions",
         ],
 
-        "gradient_boosting":
-            _serialize_hgb(
-                model.gb_win
-            ),
+        "gradient_boosting": {
+
+            "enabled_in_production":
+                False,
+
+            "role":
+                "offline_challenger_only",
+        },
     }
 
-    # Hash stable : created_at n'entre pas
-    # dans la signature du modèle.
     digest = _artifact_hash(
         artifact
     )
@@ -183,43 +211,42 @@ def serialize_model(
     return artifact
 
 
-# ============================================================
-# CLASSIFICATEUR LOGISTIQUE PORTABLE
-# ============================================================
+class StoredLogisticClassifier:
+    """
+    X est DEJA standardisé par model.scaler.
 
-class StoredBinaryClassifier:
+    Il ne faut surtout pas appliquer le scaler
+    une deuxième fois ici.
+    """
 
     def __init__(
         self,
-        artifact: dict[str, Any],
+        artifact: dict[
+            str,
+            Any,
+        ],
     ):
 
-        self.mean = np.asarray(
-            artifact[
-                "mean"
-            ],
-            dtype=float,
-        )
-
-        self.scale = np.asarray(
-            artifact[
-                "scale"
-            ],
-            dtype=float,
-        )
-
-        self.coef = np.asarray(
+        self.coef_ = np.asarray(
             artifact[
                 "coef"
             ],
             dtype=float,
         )
 
-        self.intercept = np.asarray(
+        self.intercept_ = np.asarray(
             artifact[
                 "intercept"
             ],
             dtype=float,
+        )
+
+        self.classes_ = np.asarray(
+            [
+                0,
+                1,
+            ],
+            dtype=int,
         )
 
     def predict_proba(
@@ -232,19 +259,10 @@ class StoredBinaryClassifier:
             dtype=float,
         )
 
-        z = (
-            values
-            - self.mean
-        ) / np.where(
-            self.scale == 0,
-            1.0,
-            self.scale,
-        )
-
         score = (
-            z
-            @ self.coef[0]
-            + self.intercept[0]
+            values
+            @ self.coef_[0]
+            + self.intercept_[0]
         )
 
         score = np.clip(
@@ -255,7 +273,8 @@ class StoredBinaryClassifier:
 
         p = (
             1.0
-            / (
+            /
+            (
                 1.0
                 + np.exp(
                     -score
@@ -265,81 +284,51 @@ class StoredBinaryClassifier:
 
         return np.column_stack(
             [
-                1 - p,
+                1.0 - p,
                 p,
             ]
         )
 
 
-# ============================================================
-# BT PORTABLE
-# ============================================================
+def _load_standard_scaler(
+    scaler: StandardScaler,
+    artifact: dict[
+        str,
+        Any,
+    ],
+) -> None:
 
-class StoredBT:
+    scaler.mean_ = np.asarray(
+        artifact[
+            "mean"
+        ],
+        dtype=float,
+    )
 
-    def __init__(
-        self,
-        artifact: dict[str, Any],
-    ):
+    scaler.scale_ = np.asarray(
+        artifact[
+            "scale"
+        ],
+        dtype=float,
+    )
 
-        self.scaler = (
-            StoredBinaryClassifier(
-                {
-                    "mean":
-                        artifact[
-                            "mean"
-                        ],
+    scaler.var_ = (
+        scaler.scale_
+        ** 2
+    )
 
-                    "scale":
-                        artifact[
-                            "scale"
-                        ],
-
-                    "coef":
-                        artifact[
-                            "coef"
-                        ],
-
-                    "intercept":
-                        artifact[
-                            "intercept"
-                        ],
-                }
-            )
+    scaler.n_features_in_ = (
+        len(
+            FEATURE_COLUMNS
         )
+    )
 
-    def strength(
-        self,
-        X,
-    ):
-
-        values = np.asarray(
-            X,
-            dtype=float,
-        )
-
-        z = (
-            values
-            - self.scaler.mean
-        ) / np.where(
-            self.scaler.scale == 0,
-            1.0,
-            self.scaler.scale,
-        )
-
-        return (
-            z
-            @ self.scaler.coef[0]
-            + self.scaler.intercept[0]
-        )
-
-
-# ============================================================
-# CHARGEMENT MODELE
-# ============================================================
 
 def load_stored_models(
-    record: dict[str, Any],
+    record: dict[
+        str,
+        Any,
+    ],
     model,
 ) -> None:
 
@@ -347,147 +336,111 @@ def load_stored_models(
         "artifact"
     ]
 
-    artifact_features = (
+    if (
         artifact.get(
             "feature_columns"
         )
-    )
-
-    if (
-        artifact_features
         != FEATURE_COLUMNS
     ):
 
         raise ValueError(
-            "Artefact incompatible avec "
-            "les features HorseProno V4.1."
+            "Artefact incompatible "
+            "avec les features "
+            "HorseProno V4.2."
         )
 
-    schema_version = (
+    if (
         artifact.get(
             "schema_version"
         )
-    )
-
-    if schema_version != 5:
+        != SCHEMA_VERSION
+    ):
 
         raise ValueError(
-            "Artefact incompatible avec "
-            "le schéma HorseProno V4."
+            "Artefact incompatible "
+            "avec HorseProno V4.2 "
+            "production-aligned."
+        )
+
+    recipe = artifact.get(
+        "prediction_recipe",
+        {},
+    )
+
+    win_recipe = recipe.get(
+        "win",
+        {},
+    )
+
+    model.win_bt_weight = float(
+        win_recipe.get(
+            "bt_weight",
+            0.60,
+        )
+    )
+
+    model.win_logit_weight = float(
+        win_recipe.get(
+            "logit_weight",
+            0.40,
+        )
+    )
+
+    if not np.isclose(
+        (
+            model.win_bt_weight
+            + model.win_logit_weight
+        ),
+        1.0,
+        atol=1e-12,
+    ):
+
+        raise ValueError(
+            "Poids de blend invalides "
+            "dans l'artefact."
         )
 
     # ========================================================
-    # SCALER LOGISTIQUE
+    # LOGISTIC SCALER
     # ========================================================
 
-    scaler_artifact = (
+    _load_standard_scaler(
+        model.scaler,
         artifact[
             "scaler"
-        ]
+        ],
     )
 
-    model.scaler.mean_ = (
-        np.asarray(
-            scaler_artifact[
-                "mean"
-            ],
-            dtype=float,
-        )
-    )
-
-    model.scaler.scale_ = (
-        np.asarray(
-            scaler_artifact[
-                "scale"
-            ],
-            dtype=float,
-        )
-    )
-
-    model.scaler.var_ = (
-        model.scaler.scale_
-        ** 2
-    )
-
-    model.scaler.n_features_in_ = (
-        len(
-            FEATURE_COLUMNS
-        )
-    )
-
-    # ========================================================
-    # LOGISTIQUE WIN / PLACE
-    # ========================================================
-
+    # Pas de deuxième scaling ici.
     model.logit_win = (
-        StoredBinaryClassifier(
-            {
-                **scaler_artifact,
-                **artifact[
-                    "logit_win"
-                ],
-            }
+        StoredLogisticClassifier(
+            artifact[
+                "logit_win"
+            ]
         )
     )
 
     model.logit_place = (
-        StoredBinaryClassifier(
-            {
-                **scaler_artifact,
-                **artifact[
-                    "logit_place"
-                ],
-            }
+        StoredLogisticClassifier(
+            artifact[
+                "logit_place"
+            ]
         )
     )
 
     # ========================================================
-    # BRADLEY-TERRY
+    # BRADLEY TERRY
     # ========================================================
-
-    bt_scaler = (
-        artifact[
-            "bt_scaler"
-        ]
-    )
-
-    bt_model = (
-        artifact[
-            "bt_model"
-        ]
-    )
 
     model.bt.scaler = (
         StandardScaler()
     )
 
-    model.bt.scaler.mean_ = (
-        np.asarray(
-            bt_scaler[
-                "mean"
-            ],
-            dtype=float,
-        )
-    )
-
-    model.bt.scaler.scale_ = (
-        np.asarray(
-            bt_scaler[
-                "scale"
-            ],
-            dtype=float,
-        )
-    )
-
-    model.bt.scaler.var_ = (
-        model.bt.scaler.scale_
-        ** 2
-    )
-
-    model.bt.scaler.n_features_in_ = (
-        len(
-            FEATURE_COLUMNS
-        )
+    _load_standard_scaler(
+        model.bt.scaler,
+        artifact[
+            "bt_scaler"
+        ],
     )
 
     model.bt.model = type(
@@ -498,7 +451,9 @@ def load_stored_models(
 
     model.bt.model.coef_ = (
         np.asarray(
-            bt_model[
+            artifact[
+                "bt_model"
+            ][
                 "coef"
             ],
             dtype=float,
@@ -507,7 +462,9 @@ def load_stored_models(
 
     model.bt.model.intercept_ = (
         np.asarray(
-            bt_model[
+            artifact[
+                "bt_model"
+            ][
                 "intercept"
             ],
             dtype=float,
@@ -543,14 +500,16 @@ def load_stored_models(
     )
 
 
-# ============================================================
-# ENREGISTREMENT SUPABASE
-# ============================================================
-
 def build_model_record(
     model,
-    metrics: dict[str, Any],
-) -> dict[str, Any]:
+    metrics: dict[
+        str,
+        Any,
+    ],
+) -> dict[
+    str,
+    Any,
+]:
 
     artifact = serialize_model(
         model,
@@ -564,10 +523,11 @@ def build_model_record(
     return {
 
         "model_name":
-            "horseprono_v4_1",
+            "horseprono_v4_2",
 
         "model_type":
             (
+                "production_aligned_"
                 "age_sex_discipline_aware_"
                 "bradley_terry_"
                 "logistic_calibrated"

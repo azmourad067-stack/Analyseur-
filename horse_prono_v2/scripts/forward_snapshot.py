@@ -406,13 +406,26 @@ except Exception as exc:
         print()
         print(f"R{reunion}C{course} @ {start_time.isoformat()}")
 
-        payload = get_participants(target_date, reunion, course)
-        race = participants_to_df(
-            payload,
-            target_date,
-            reunion,
-            course,
-        )
+        payload = get_participants(
+    target_date,
+    reunion,
+    course,
+)
+
+race = participants_to_df(
+    payload,
+    target_date,
+    reunion,
+    course,
+)
+
+# ============================================================
+# NON-PARTANTS
+# ============================================================
+
+non_runners = non_runner_numbers(
+    payload
+)
 
         if race.empty:
             print("  Aucun participant.")

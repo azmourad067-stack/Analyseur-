@@ -3,8 +3,7 @@ name: HorseProno forward snapshot
 on:
   workflow_dispatch:
   schedule:
-    schedule:
-  - cron: "3,13,23,33,43,53 * * * *"
+    - cron: "3,13,23,33,43,53 * * * *"
 
 concurrency:
   group: horseprono-forward-snapshot

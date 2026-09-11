@@ -6,6 +6,7 @@ PMU_BASE_URL = (
 )
 
 REQUEST_TIMEOUT = 20
+
 CACHE_TTL_SECONDS = 600
 
 
@@ -24,55 +25,31 @@ HISTORY_COLUMNS = [
     "odds",
     "draw",
     "weight",
+    "age",
+    "sex",
     "recent_form",
     "finish_position",
 ]
 
 
 # ============================================================
-# HORSEPRONO V4 FEATURES
-# ============================================================
-#
-# Toutes les variables doivent être connues avant le départ.
-#
-# Les nouvelles features V4 permettent au modèle de ne plus
-# traiter de la même façon :
-#
-# - le Plat
-# - l'Attelé Autostart
-# - l'Attelé Volte
-# - le Trot Monté
-# - l'Obstacle
-#
-# Les interactions sont particulièrement importantes :
-# par exemple le poids n'a pas le même sens en Plat qu'en
-# Attelé, et la corde est particulièrement intéressante
-# en Autostart.
+# HORSEPRONO V4.1 FEATURES
 # ============================================================
 
 FEATURE_COLUMNS = [
 
-    # --------------------------------------------------------
     # Marché
-    # --------------------------------------------------------
-
     "log_odds",
     "market_prob",
 
-    # --------------------------------------------------------
     # Course / participant
-    # --------------------------------------------------------
-
     "draw_norm",
     "draw_low_advantage",
     "weight_rel",
     "distance_norm",
     "field_size_norm",
 
-    # --------------------------------------------------------
     # Historique temporel
-    # --------------------------------------------------------
-
     "horse_win_rate",
     "horse_place_rate",
 
@@ -90,7 +67,20 @@ FEATURE_COLUMNS = [
     "trainer_starts_prior",
 
     # --------------------------------------------------------
-    # Discipline V4
+    # AGE / SEXE V4.1
+    # --------------------------------------------------------
+
+    "age_norm",
+    "age_relative",
+    "age_missing",
+
+    # Mâle = catégorie de référence.
+    "sex_female",
+    "sex_gelding",
+    "sex_known",
+
+    # --------------------------------------------------------
+    # Discipline
     # --------------------------------------------------------
 
     "discipline_plat",
@@ -100,41 +90,46 @@ FEATURE_COLUMNS = [
     "discipline_obstacle",
 
     # --------------------------------------------------------
-    # Interactions PLAT
+    # PLAT
     # --------------------------------------------------------
 
     "plat_weight_rel",
     "plat_draw_norm",
     "plat_distance_norm",
+    "plat_age_norm",
 
     # --------------------------------------------------------
-    # Interactions AUTOSTART
+    # AUTOSTART
     # --------------------------------------------------------
 
     "autostart_draw_norm",
     "autostart_distance_norm",
     "autostart_field_size_norm",
+    "autostart_age_norm",
 
     # --------------------------------------------------------
-    # Interactions VOLTE
+    # VOLTE
     # --------------------------------------------------------
 
     "volte_distance_norm",
     "volte_field_size_norm",
+    "volte_age_norm",
 
     # --------------------------------------------------------
-    # Interactions TROT MONTE
+    # MONTE
     # --------------------------------------------------------
 
     "monte_weight_rel",
     "monte_distance_norm",
+    "monte_age_norm",
 
     # --------------------------------------------------------
-    # Interactions OBSTACLE
+    # OBSTACLE
     # --------------------------------------------------------
 
     "obstacle_weight_rel",
     "obstacle_distance_norm",
+    "obstacle_age_norm",
 ]
 
 

@@ -177,8 +177,26 @@ with tab_prono:
                 ch = choices[ix]
                 if st.button("Charger cette course", type="primary"):
                     try:
-                        race = participants_to_df(pmu_get_participants(d, ch["reunion"], ch["course"]), d, ch["reunion"], ch["course"])
-                        race_id = race.iloc[0]["race_id"] if not race.empty else None
+                        race = participants_to_df( pmu_get_participants(d , ch["reunion"], ch["course"], ) , d, ch["reunion"], ch["course"], )  if not race.empty: 
+    metadata = { "discipline": ch.get(  "discipline" ),   "hippodrome": ch.get(  "hippodrome"), "distance":  ch.get(
+                "distance" ), "terrain": ch.get(    "terrain" ),  "field_size":  ch.get(  "field_size" ), }
+
+    for column, value in metadata.items():
+
+        if value is not None:
+            race[
+                column
+            ] = value
+
+    race_id = race.iloc[
+        0
+    ][
+        "race_id"
+    ]
+
+else:
+
+    race_id = None
                     except Exception as exc:
                         st.error(f"Impossible de récupérer les partants : {exc}")
             else:

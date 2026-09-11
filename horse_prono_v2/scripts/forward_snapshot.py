@@ -9,7 +9,23 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+HORSE_PRONO_ROOT = os.path.dirname(
+    os.path.dirname(__file__)
+)
+
+PROJECT_ROOT = os.path.dirname(
+    HORSE_PRONO_ROOT
+)
+
+sys.path.insert(
+    0,
+    HORSE_PRONO_ROOT,
+)
+
+sys.path.insert(
+    0,
+    PROJECT_ROOT,
+)
 
 from app_core.data import normalize_race_input
 from app_core.db import (

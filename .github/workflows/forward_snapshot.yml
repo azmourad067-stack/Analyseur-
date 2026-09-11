@@ -2,6 +2,7 @@ name: HorseProno forward snapshot
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "3,13,23,33,43,53 * * * *"
 
@@ -10,7 +11,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+
   snapshot:
+
     runs-on: ubuntu-latest
 
     defaults:
@@ -18,8 +21,18 @@ jobs:
         working-directory: horse_prono_v2
 
     steps:
+
+      # ======================================================
+      # REPOSITORY
+      # ======================================================
+
       - name: Checkout
         uses: actions/checkout@v4
+
+
+      # ======================================================
+      # PYTHON
+      # ======================================================
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -28,14 +41,57 @@ jobs:
           cache: "pip"
           cache-dependency-path: horse_prono_v2/requirements.txt
 
+
+      # ======================================================
+      # DEPENDENCIES HORSEPRONO
+      # ======================================================
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install joblib
 
-      - name: Capture pre-race forward bets
+
+      # ======================================================
+      # PYTORCH CPU POUR NEURAL #9
+      # ======================================================
+
+      - name: Install PyTorch CPU
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+
+      # ======================================================
+      # VERIFICATION DU MODELE NEURAL FIGE
+      # ======================================================
+
+      - name: Check Neural V1 files
+        run: |
+          echo "=========================================="
+          echo "HORSEPRONO - NEURAL V1 FILES"
+          echo "=========================================="
+
+          test -f ../models/neural/horseprono_neural_v1.pt
+          test -f ../models/neural/horseprono_neural_v1_scaler.joblib
+          test -f ../models/neural/horseprono_neural_v1_features.json
+
+          echo "✅ Neural V1 files found"
+
+          ls -lh ../models/neural/
+
+
+      # ======================================================
+      # FORWARD SNAPSHOT
+      # MODELE #8 + NEURAL #9
+      # ======================================================
+
+      - name: Capture pre-race forward predictions
         env:
+
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
         run: |
           python -u scripts/forward_snapshot.py

@@ -174,9 +174,30 @@ def prepare_inference_dataframe(
 
     df = df.copy()
 
-    # --------------------------------------------------------
+    # ========================================================
+    # ALIASES PMU LIVE -> FORMAT NEURAL TRAINING
+    # ========================================================
+
+    aliases = {
+        "jockey": "jockey_name",
+        "trainer": "trainer_name",
+        "weight": "weight_kg",
+        "reunion": "meeting_number",
+        "course_number": "race_number",
+        "distance": "distance_m",
+    }
+
+    for source, target in aliases.items():
+
+        if (
+            source in df.columns
+            and target not in df.columns
+        ):
+            df[target] = df[source]
+
+    # ========================================================
     # COTE
-    # --------------------------------------------------------
+    # ========================================================
 
     if "odds" not in df.columns:
         df["odds"] = np.nan
@@ -203,9 +224,9 @@ def prepare_inference_dataframe(
         np.nan,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # MUSIQUE
-    # --------------------------------------------------------
+    # ========================================================
 
     if "recent_form" not in df.columns:
         df["recent_form"] = None

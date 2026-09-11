@@ -1,0 +1,59 @@
+name: Neural V1-B - Train Without Odds
+
+on:
+  workflow_dispatch:
+
+jobs:
+  train-neural-v1b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Install PyTorch CPU
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: |
+          python -m pip install \
+            numpy \
+            pandas \
+            scikit-learn \
+            joblib \
+            supabase \
+            streamlit
+
+      - name: Train HorseProno Neural V1-B without odds
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python -u -m neural.train_no_odds
+
+      - name: Show generated files
+        run: |
+          echo "=========================================="
+          echo "HORSEPRONO NEURAL V1-B - FILES"
+          echo "=========================================="
+          find models/neural/v1b_no_odds -type f -print -exec ls -lh {} \;
+
+      - name: Upload Neural V1-B model
+        uses: actions/upload-artifact@v4
+        with:
+          name: horseprono-neural-v1b-no-odds
+          path: models/neural/v1b_no_odds/
+          if-no-files-found: error
+          retention-days: 30

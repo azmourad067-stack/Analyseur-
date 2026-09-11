@@ -20,9 +20,6 @@ HEADERS = {
 # ============================================================
 
 def _get_json(url: str) -> Any:
-    """
-    Effectue une requête HTTP GET et retourne le JSON.
-    """
     response = requests.get(
         url,
         headers=HEADERS,
@@ -35,12 +32,6 @@ def _get_json(url: str) -> Any:
 
 
 def get_programme(race_date: date) -> Any:
-    """
-    Récupère le programme PMU d'une journée.
-    Exemple :
-        /programme/02092026
-    """
-
     d = race_date.strftime("%d%m%Y")
 
     url = f"{PMU_BASE_URL}/programme/{d}"
@@ -53,12 +44,6 @@ def get_participants(
     reunion: int,
     course: int,
 ) -> Any:
-    """
-    Récupère les participants d'une course PMU.
-    Exemple :
-        /programme/02092026/R1/C4/participants
-    """
-
     d = race_date.strftime("%d%m%Y")
 
     url = (
@@ -74,37 +59,6 @@ def get_participants(
 # ============================================================
 
 def _as_int(value):
-    def _weight_kg(value):
-    """
-    Convertit les poids PMU vers des kilogrammes.
-
-    Exemples observés :
-        580 -> 58.0 kg
-        585 -> 58.5 kg
-        550 -> 55.0 kg
-    """
-
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return None
-
-    if value <= 0:
-        return None
-
-    # Les poids PMU observés sont exprimés
-    # en dixièmes de kilogramme.
-    if value >= 200:
-        value = value / 10.0
-
-    if not 30 <= value <= 100:
-        return None
-
-    return round(value, 1)
-    """
-    Convertit une valeur en entier de façon sûre.
-    """
-
     try:
         return int(value)
 
@@ -112,19 +66,81 @@ def _as_int(value):
         return None
 
 
-def _pick(obj: dict, *paths, default=None):
+def _weight_kg(value):
     """
-    Cherche une valeur dans plusieurs chemins possibles.
+    Convertit les poids PMU vers des kilogrammes.
 
-    Exemple :
-        _pick(obj, "jockey.nom", "driver.nom", "jockey")
+    Valeurs observées :
+        580 -> 58.0 kg
+        585 -> 58.5 kg
+        550 -> 55.0 kg
     """
 
+    try:
+        value = float(value)
+
+    except (TypeError, ValueError):
+        return None
+
+    if value <= 0:
+        return None
+
+    # PMU : poids observés en dixièmes de kg.
+    if value >= 200:
+        value = value / 10.0
+
+    # Garde-fou contre les valeurs aberrantes.
+    if not 30 <= value <= 100:
+        return None
+
+    return round(
+        value,
+        1,
+    )
+
+
+def _text(
+    value,
+    default="",
+):
+    if value is None:
+        return default
+
+    if isinstance(
+        value,
+        dict,
+    ):
+        value = (
+            value.get("libelle")
+            or value.get("libelleCourt")
+            or value.get("libelleLong")
+            or value.get("nom")
+            or value.get("value")
+        )
+
+    if value is None:
+        return default
+
+    value = str(
+        value
+    ).strip()
+
+    return value or default
+
+
+def _pick(
+    obj: dict,
+    *paths,
+    default=None,
+):
     for path in paths:
 
         current = obj
 
-        if isinstance(path, str):
+        if isinstance(
+            path,
+            str,
+        ):
             path = path.split(".")
 
         try:
@@ -135,7 +151,11 @@ def _pick(obj: dict, *paths, default=None):
             if current is not None:
                 return current
 
-        except (KeyError, TypeError, IndexError):
+        except (
+            KeyError,
+            TypeError,
+            IndexError,
+        ):
             continue
 
     return default
@@ -145,31 +165,38 @@ def _find_list_of_dicts(
     obj: Any,
     keys_hint: tuple[str, ...],
 ) -> list[dict]:
-    """
-    Recherche récursivement des listes contenant
-    des dictionnaires ressemblant à des participants.
-    """
-
     found: list[dict] = []
 
-    if isinstance(obj, dict):
+    if isinstance(
+        obj,
+        dict,
+    ):
 
-        for _, value in obj.items():
+        for value in obj.values():
 
-            if isinstance(value, list):
+            if isinstance(
+                value,
+                list,
+            ):
 
-                if all(isinstance(x, dict) for x in value):
+                if all(
+                    isinstance(x, dict)
+                    for x in value
+                ):
 
                     if any(
-                        any(key in item for key in keys_hint)
+                        any(
+                            key in item
+                            for key in keys_hint
+                        )
                         for item in value
                     ):
-                        found.extend(value)
+                        found.extend(
+                            value
+                        )
 
-                # On continue également la recherche à l'intérieur
-                # de la liste pour être compatible avec plusieurs
-                # structures JSON PMU.
                 for item in value:
+
                     found.extend(
                         _find_list_of_dicts(
                             item,
@@ -177,7 +204,10 @@ def _find_list_of_dicts(
                         )
                     )
 
-            elif isinstance(value, dict):
+            elif isinstance(
+                value,
+                dict,
+            ):
 
                 found.extend(
                     _find_list_of_dicts(
@@ -186,7 +216,10 @@ def _find_list_of_dicts(
                     )
                 )
 
-    elif isinstance(obj, list):
+    elif isinstance(
+        obj,
+        list,
+    ):
 
         for item in obj:
 
@@ -200,150 +233,382 @@ def _find_list_of_dicts(
     return found
 
 
+def _normalize_discipline(
+    course: dict[str, Any],
+) -> str:
+    discipline = _text(
+        course.get(
+            "discipline"
+        ),
+        "INCONNU",
+    ).upper()
+
+    specialite = _text(
+        course.get(
+            "specialite"
+        ),
+        "",
+    ).upper()
+
+    category = _text(
+        course.get(
+            "categorieParticularite"
+        ),
+        "",
+    ).upper()
+
+    combined = (
+        f"{discipline} "
+        f"{specialite} "
+        f"{category}"
+    )
+
+    if "ATTELE" in combined:
+
+        if "AUTOSTART" in combined:
+            return "ATTELE_AUTOSTART"
+
+        return "ATTELE_VOLTE"
+
+    if "MONTE" in combined:
+        return "TROT_MONTE"
+
+    if "STEEPLE" in combined:
+        return "STEEPLECHASE"
+
+    if "CROSS" in combined:
+        return "CROSS_COUNTRY"
+
+    if "HAIE" in combined:
+        return "HAIES"
+
+    if "PLAT" in combined:
+        return "PLAT"
+
+    return discipline
+
+
+def _extract_terrain(
+    reunion_obj: dict[str, Any],
+    course_obj: dict[str, Any],
+) -> str:
+    candidates = [
+        course_obj.get(
+            "terrain"
+        ),
+        course_obj.get(
+            "etatTerrain"
+        ),
+        course_obj.get(
+            "etatPiste"
+        ),
+        course_obj.get(
+            "natureTerrain"
+        ),
+        reunion_obj.get(
+            "terrain"
+        ),
+        reunion_obj.get(
+            "etatTerrain"
+        ),
+        reunion_obj.get(
+            "etatPiste"
+        ),
+    ]
+
+    meteo = reunion_obj.get(
+        "meteo"
+    )
+
+    if isinstance(
+        meteo,
+        dict,
+    ):
+
+        candidates.extend(
+            [
+                meteo.get(
+                    "terrain"
+                ),
+                meteo.get(
+                    "etatTerrain"
+                ),
+                meteo.get(
+                    "etatPiste"
+                ),
+            ]
+        )
+
+    for candidate in candidates:
+
+        value = _text(
+            candidate,
+            "",
+        )
+
+        if value:
+            return value
+
+    return "INCONNU"
+
+
 # ============================================================
 # PROGRAMME PMU
 # ============================================================
 
-def programme_choices(programme: Any) -> list[dict]:
+def programme_choices(
+    programme: Any,
+) -> list[dict]:
     """
-    Extrait toutes les courses disponibles dans le programme PMU.
+    Extrait les courses disponibles dans le programme PMU.
 
-    Structures supportées :
-
-        {
-            "reunions": [...]
-        }
-
-    ou :
-
-        {
-            "programme": {
-                "reunions": [...]
-            }
-        }
-
-    Retour :
-
-        [
-            {"reunion": 1, "course": 1},
-            {"reunion": 1, "course": 2},
-            ...
-        ]
+    Retourne également les métadonnées nécessaires
+    pour les futurs imports.
     """
 
     choices: list[dict] = []
 
-    if not isinstance(programme, dict):
+    if not isinstance(
+        programme,
+        dict,
+    ):
         return choices
 
-    # --------------------------------------------------------
-    # Le programme peut être directement à la racine
-    # ou enveloppé dans {"programme": {...}}
-    # --------------------------------------------------------
+    root = programme.get(
+        "programme"
+    )
 
-    root = programme.get("programme")
-
-    if not isinstance(root, dict):
+    if not isinstance(
+        root,
+        dict,
+    ):
         root = programme
 
-    reunions = root.get("reunions")
+    reunions = root.get(
+        "reunions"
+    )
 
-    # --------------------------------------------------------
-    # Fallback : recherche récursive d'une clé "reunions"
-    # --------------------------------------------------------
-
-    if not isinstance(reunions, list):
+    if not isinstance(
+        reunions,
+        list,
+    ):
 
         def find_reunions(obj):
 
-            if isinstance(obj, dict):
+            if isinstance(
+                obj,
+                dict,
+            ):
 
-                if isinstance(obj.get("reunions"), list):
-                    return obj["reunions"]
+                if isinstance(
+                    obj.get("reunions"),
+                    list,
+                ):
+                    return obj[
+                        "reunions"
+                    ]
 
                 for value in obj.values():
 
-                    result = find_reunions(value)
+                    result = find_reunions(
+                        value
+                    )
 
                     if result is not None:
                         return result
 
-            elif isinstance(obj, list):
+            elif isinstance(
+                obj,
+                list,
+            ):
 
                 for value in obj:
 
-                    result = find_reunions(value)
+                    result = find_reunions(
+                        value
+                    )
 
                     if result is not None:
                         return result
 
             return None
 
-        reunions = find_reunions(programme)
+        reunions = find_reunions(
+            programme
+        )
 
-    if not isinstance(reunions, list):
+    if not isinstance(
+        reunions,
+        list,
+    ):
         return choices
-
-    # --------------------------------------------------------
-    # Parcours réunions -> courses
-    # --------------------------------------------------------
 
     for reunion_obj in reunions:
 
-        if not isinstance(reunion_obj, dict):
+        if not isinstance(
+            reunion_obj,
+            dict,
+        ):
             continue
 
         reunion = _as_int(
-            reunion_obj.get("numOfficiel")
-            or reunion_obj.get("numReunion")
-            or reunion_obj.get("numReunionProgramme")
-            or reunion_obj.get("numero")
+            reunion_obj.get(
+                "numOfficiel"
+            )
+            or reunion_obj.get(
+                "numReunion"
+            )
+            or reunion_obj.get(
+                "numReunionProgramme"
+            )
+            or reunion_obj.get(
+                "numero"
+            )
         )
 
-        courses = reunion_obj.get("courses", [])
+        if reunion is None:
+            continue
 
-        if not isinstance(courses, list):
+        hippodrome_obj = (
+            reunion_obj.get(
+                "hippodrome"
+            )
+        )
+
+        if isinstance(
+            hippodrome_obj,
+            dict,
+        ):
+
+            hippodrome = _text(
+                hippodrome_obj.get(
+                    "libelleCourt"
+                )
+                or hippodrome_obj.get(
+                    "libelleLong"
+                )
+                or hippodrome_obj.get(
+                    "nom"
+                ),
+                "INCONNU",
+            )
+
+        else:
+
+            hippodrome = _text(
+                hippodrome_obj,
+                "INCONNU",
+            )
+
+        courses = reunion_obj.get(
+            "courses",
+            [],
+        )
+
+        if not isinstance(
+            courses,
+            list,
+        ):
             continue
 
         for course_obj in courses:
 
-            if not isinstance(course_obj, dict):
+            if not isinstance(
+                course_obj,
+                dict,
+            ):
                 continue
 
-            # Certains JSON répètent numReunion
-            # dans chaque objet course.
             current_reunion = reunion
 
             if current_reunion is None:
 
                 current_reunion = _as_int(
-                    course_obj.get("numReunion")
-                    or course_obj.get("numReunionProgramme")
+                    course_obj.get(
+                        "numReunion"
+                    )
+                    or course_obj.get(
+                        "numReunionProgramme"
+                    )
                 )
 
             course = _as_int(
-                course_obj.get("numOrdre")
-                or course_obj.get("numCourse")
-                or course_obj.get("numOfficiel")
-                or course_obj.get("numero")
+                course_obj.get(
+                    "numOrdre"
+                )
+                or course_obj.get(
+                    "numCourse"
+                )
+                or course_obj.get(
+                    "numOfficiel"
+                )
+                or course_obj.get(
+                    "numero"
+                )
             )
 
-            if current_reunion is None:
+            if (
+                current_reunion is None
+                or course is None
+            ):
                 continue
 
-            if course is None:
-                continue
+            label = _text(
+                course_obj.get(
+                    "libelle"
+                )
+                or course_obj.get(
+                    "nom"
+                )
+                or course_obj.get(
+                    "libelleCourt"
+                ),
+                f"Course {course}",
+            )
 
             choices.append(
                 {
-                    "reunion": current_reunion,
-                    "course": course,
+                    "reunion":
+                        current_reunion,
+
+                    "course":
+                        course,
+
+                    "label":
+                        label,
+
+                    "discipline":
+                        _normalize_discipline(
+                            course_obj
+                        ),
+
+                    "hippodrome":
+                        hippodrome,
+
+                    "distance":
+                        _as_int(
+                            course_obj.get(
+                                "distance"
+                            )
+                        ),
+
+                    "terrain":
+                        _extract_terrain(
+                            reunion_obj,
+                            course_obj,
+                        ),
+
+                    "field_size":
+                        _as_int(
+                            course_obj.get(
+                                "nombreDeclaresPartants"
+                            )
+                            or course_obj.get(
+                                "nombrePartants"
+                            )
+                        ),
                 }
             )
-
-    # --------------------------------------------------------
-    # Suppression des doublons
-    # --------------------------------------------------------
 
     unique = {}
 
@@ -375,10 +640,6 @@ def participants_to_df(
     reunion: int,
     course: int,
 ) -> pd.DataFrame:
-    """
-    Transforme le JSON participants PMU
-    en DataFrame standard HorseProno.
-    """
 
     candidates = _find_list_of_dicts(
         payload,
@@ -394,17 +655,16 @@ def participants_to_df(
         ),
     )
 
-    # --------------------------------------------------------
-    # Suppression des doublons
-    # --------------------------------------------------------
-
     unique_participants = []
 
     seen = set()
 
     for participant in candidates:
 
-        if not isinstance(participant, dict):
+        if not isinstance(
+            participant,
+            dict,
+        ):
             continue
 
         number = _pick(
@@ -431,16 +691,19 @@ def participants_to_df(
         if key in seen:
             continue
 
-        if number is None and not name:
+        if (
+            number is None
+            and not name
+        ):
             continue
 
-        seen.add(key)
+        seen.add(
+            key
+        )
 
-        unique_participants.append(participant)
-
-    # --------------------------------------------------------
-    # Transformation des participants
-    # --------------------------------------------------------
+        unique_participants.append(
+            participant
+        )
 
     rows = []
 
@@ -476,7 +739,10 @@ def participants_to_df(
             default=None,
         )
 
-        if isinstance(odds, dict):
+        if isinstance(
+            odds,
+            dict,
+        ):
 
             odds = _pick(
                 odds,
@@ -499,7 +765,10 @@ def participants_to_df(
             default="",
         )
 
-        if isinstance(jockey, dict):
+        if isinstance(
+            jockey,
+            dict,
+        ):
 
             jockey = _pick(
                 jockey,
@@ -521,7 +790,10 @@ def participants_to_df(
             default="",
         )
 
-        if isinstance(trainer, dict):
+        if isinstance(
+            trainer,
+            dict,
+        ):
 
             trainer = _pick(
                 trainer,
@@ -531,7 +803,7 @@ def participants_to_df(
             )
 
         # ----------------------------------------------------
-        # Numéro de corde
+        # Corde
         # ----------------------------------------------------
 
         draw = _pick(
@@ -543,54 +815,62 @@ def participants_to_df(
         )
 
         # ----------------------------------------------------
+        # Age
+        # ----------------------------------------------------
+
+        age = _as_int(
+            _pick(
+                participant,
+                "age",
+                default=None,
+            )
+        )
+
+        # ----------------------------------------------------
+        # Sexe
+        # ----------------------------------------------------
+
+        sex = _pick(
+            participant,
+            "sexe",
+            "sex",
+            default="",
+        )
+
+        # ----------------------------------------------------
         # Poids
         # ----------------------------------------------------
 
-       age = _as_int(
-    _pick(
-        participant,
-        "age",
-        default=None,
-    )
-)
+        condition_weight = _weight_kg(
+            _pick(
+                participant,
+                "poidsConditionMonte",
+                default=None,
+            )
+        )
 
-sex = _pick(
-    participant,
-    "sexe",
-    "sex",
-    default="",
-)
+        handicap_weight = _weight_kg(
+            _pick(
+                participant,
+                "handicapPoids",
+                default=None,
+            )
+        )
 
-condition_weight = _weight_kg(
-    _pick(
-        participant,
-        "poidsConditionMonte",
-        default=None,
-    )
-)
+        generic_weight = _weight_kg(
+            _pick(
+                participant,
+                "poids",
+                "poidsCheval",
+                default=None,
+            )
+        )
 
-handicap_weight = _weight_kg(
-    _pick(
-        participant,
-        "handicapPoids",
-        default=None,
-    )
-)
-
-generic_weight = _weight_kg(
-    _pick(
-        participant,
-        "poids",
-        "poidsCheval",
-        default=None,
-    )
-)
-
-weight = (
-    condition_weight
-    or handicap_weight
-    or generic_weight
-)
+        weight = (
+            condition_weight
+            or handicap_weight
+            or generic_weight
+        )
 
         # ----------------------------------------------------
         # Musique
@@ -619,7 +899,8 @@ weight = (
         )
 
         # ----------------------------------------------------
-        # Informations course
+        # Métadonnées éventuellement présentes
+        # dans le payload participants
         # ----------------------------------------------------
 
         discipline = _pick(
@@ -662,7 +943,10 @@ weight = (
             default="INCONNU",
         )
 
-        if isinstance(terrain, dict):
+        if isinstance(
+            terrain,
+            dict,
+        ):
 
             terrain = _pick(
                 terrain,
@@ -671,10 +955,6 @@ weight = (
                 default="INCONNU",
             )
 
-        # ----------------------------------------------------
-        # Ligne finale
-        # ----------------------------------------------------
-
         rows.append(
             {
                 "race_id": (
@@ -682,54 +962,84 @@ weight = (
                     f"{race_date.isoformat()}"
                 ),
 
-                "race_date": pd.Timestamp(race_date),
+                "race_date":
+                    pd.Timestamp(
+                        race_date
+                    ),
 
-                "reunion": reunion,
+                "reunion":
+                    reunion,
 
-                "course_number": course,
+                "course_number":
+                    course,
 
-                "discipline": discipline,
+                "discipline":
+                    discipline,
 
-                "hippodrome": hippodrome,
+                "hippodrome":
+                    hippodrome,
 
-                "distance": distance,
+                "distance":
+                    distance,
 
-                "terrain": terrain,
+                "terrain":
+                    terrain,
 
-                "field_size": None,
+                "field_size":
+                    None,
 
-                "horse_number": number,
+                "horse_number":
+                    number,
 
-                "horse_name": name,
+                "horse_name":
+                    name,
 
-                "jockey": jockey,
+                "jockey":
+                    jockey,
 
-                "trainer": trainer,
+                "trainer":
+                    trainer,
 
-                "odds": odds,
+                "odds":
+                    odds,
 
-                "draw": draw,
+                "draw":
+                    draw,
 
-                "weight": weight, "age": age,
-"sex": sex,
+                "weight":
+                    weight,
 
-                "recent_form": recent_form,
+                "age":
+                    age,
 
-                "career_runs": None,
+                "sex":
+                    sex,
 
-                "career_wins": None,
+                "recent_form":
+                    recent_form,
 
-                "career_places": None,
+                "career_runs":
+                    None,
 
-                "finish_position": finish_position,
+                "career_wins":
+                    None,
+
+                "career_places":
+                    None,
+
+                "finish_position":
+                    finish_position,
             }
         )
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(
+        rows
+    )
 
-    # Nombre de partants de la course
     if not df.empty:
 
-        df["field_size"] = len(df)
+        df["field_size"] = (
+            len(df)
+        )
 
     return df

@@ -296,8 +296,42 @@ def main() -> None:
         print("Objectif déjà rempli en paris non void. Aucun nouveau snapshot.")
         return
 
-    record = _model_record(client, experiment)
-    model = HorseRacingModel.from_stored_record(record)
+    record = _model_record(
+    client,
+    experiment,
+)
+
+model = HorseRacingModel.from_stored_record(
+    record
+)
+
+# ============================================================
+# CHARGEMENT NEURAL V1 - MODELE #9
+# ============================================================
+
+try:
+
+    neural_bundle = load_forward_neural(
+        client
+    )
+
+    print(
+        "✅ Neural #9 chargé correctement."
+    )
+
+except Exception as exc:
+
+    neural_bundle = None
+
+    print(
+        "⚠️ Neural #9 indisponible : "
+        f"{exc}"
+    )
+
+    print(
+        "Le modèle #8 continue "
+        "normalement."
+    )
 
     threshold = float(experiment["edge_threshold"])
     min_minutes = int(experiment["capture_min_minutes"])

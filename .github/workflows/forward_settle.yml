@@ -3,7 +3,8 @@ name: HorseProno forward settlement
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
+    schedule:
+  - cron: "7,37 * * * *"
 
 concurrency:
   group: horseprono-forward-settlement

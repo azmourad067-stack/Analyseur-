@@ -30,50 +30,60 @@ def _norm_text(
 
     text = (
         ""
-        if pd.isna(value)
-        else str(value)
+        if pd.isna(
+            value
+        )
+        else str(
+            value
+        )
         .strip()
         .lower()
     )
 
-    text = re.sub(
+    return re.sub(
         r"\s+",
         " ",
         text,
     )
 
-    return text
-
 
 def _discipline_bucket(
     value: Any,
 ) -> str:
-    """
-    Regroupe les disciplines PMU dans les familles V4.
-
-    Sorties possibles :
-        PLAT
-        AUTOSTART
-        VOLTE
-        MONTE
-        OBSTACLE
-        OTHER
-    """
 
     if value is None:
         return "OTHER"
 
-    text = str(
-        value
-    ).strip().upper()
+    text = (
+        str(
+            value
+        )
+        .strip()
+        .upper()
+    )
 
     text = (
         text
-        .replace("É", "E")
-        .replace("È", "E")
-        .replace("Ê", "E")
-        .replace("À", "A")
-        .replace("Ô", "O")
+        .replace(
+            "É",
+            "E",
+        )
+        .replace(
+            "È",
+            "E",
+        )
+        .replace(
+            "Ê",
+            "E",
+        )
+        .replace(
+            "À",
+            "A",
+        )
+        .replace(
+            "Ô",
+            "O",
+        )
     )
 
     if "AUTOSTART" in text:
@@ -91,20 +101,59 @@ def _discipline_bucket(
     if "PLAT" in text:
         return "PLAT"
 
-    obstacle_tokens = (
-        "HAIE",
-        "STEEPLE",
-        "CROSS",
-        "OBSTACLE",
-    )
-
     if any(
         token in text
-        for token in obstacle_tokens
+        for token in (
+            "HAIE",
+            "STEEPLE",
+            "CROSS",
+            "OBSTACLE",
+        )
     ):
         return "OBSTACLE"
 
     return "OTHER"
+
+
+def _sex_bucket(
+    value: Any,
+) -> str:
+
+    if value is None:
+        return "UNKNOWN"
+
+    text = (
+        str(
+            value
+        )
+        .strip()
+        .upper()
+    )
+
+    if not text:
+        return "UNKNOWN"
+
+    if (
+        "HONGRE"
+        in text
+    ):
+        return "GELDING"
+
+    if (
+        "FEMELLE"
+        in text
+    ):
+        return "FEMALE"
+
+    if (
+        "MALE"
+        in text
+        or "MÂLE"
+        in text
+    ):
+        return "MALE"
+
+    return "UNKNOWN"
 
 
 # ============================================================
@@ -114,14 +163,6 @@ def _discipline_bucket(
 def build_temporal_training_frame(
     history: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Construit les statistiques strictement antérieures
-    à la course courante.
-
-    Règle essentielle :
-    le résultat de la course courante ne doit jamais
-    être utilisé pour prédire cette même course.
-    """
 
     df = normalize_history(
         history
@@ -140,7 +181,9 @@ def build_temporal_training_frame(
     df[
         "race_date"
     ] = pd.to_datetime(
-        df["race_date"],
+        df[
+            "race_date"
+        ],
         errors="coerce",
     )
 
@@ -178,7 +221,9 @@ def build_temporal_training_frame(
         "race_key"
     ] = df[
         "race_id"
-    ].astype(str)
+    ].astype(
+        str
+    )
 
     df = (
         df
@@ -194,9 +239,9 @@ def build_temporal_training_frame(
         )
     )
 
-    # ========================================================
-    # RESULTATS ANTERIEURS UNIQUEMENT
-    # ========================================================
+    # --------------------------------------------------------
+    # Résultats antérieurs uniquement
+    # --------------------------------------------------------
 
     df[
         "is_win"
@@ -205,7 +250,9 @@ def build_temporal_training_frame(
             "finish_position"
         ]
         == 1
-    ).astype(float)
+    ).astype(
+        float
+    )
 
     df[
         "is_place"
@@ -214,7 +261,9 @@ def build_temporal_training_frame(
             "finish_position"
         ]
         <= 3
-    ).astype(float)
+    ).astype(
+        float
+    )
 
     for entity in [
         "horse_key",
@@ -276,13 +325,16 @@ def build_temporal_training_frame(
 
         df[
             f"{prefix}_starts_prior"
-        ] = prior_starts.astype(
-            float
+        ] = (
+            prior_starts
+            .astype(
+                float
+            )
         )
 
-    # ========================================================
-    # FORME RECENTE
-    # ========================================================
+    # --------------------------------------------------------
+    # Forme récente
+    # --------------------------------------------------------
 
     form_values: dict[
         str,
@@ -294,6 +346,7 @@ def build_temporal_training_frame(
     )
 
     recent_form = []
+
     recent_consistency = []
 
     for _, row in df.iterrows():
@@ -372,10 +425,12 @@ def build_temporal_training_frame(
                 1.0,
                 1.0
                 - (
-                    finish - 1.0
+                    finish
+                    - 1.0
                 )
                 / (
-                    field - 1.0
+                    field
+                    - 1.0
                 ),
             ),
         )
@@ -398,7 +453,7 @@ def build_temporal_training_frame(
 
 
 # ============================================================
-# MATRICE DE FEATURES V4
+# MATRICE FEATURES
 # ============================================================
 
 def make_features(
@@ -407,20 +462,18 @@ def make_features(
     already_temporal: bool = False,
 ) -> pd.DataFrame:
 
-    if already_temporal:
-
-        x = df.copy()
-
-    else:
-
-        x = normalize_race_input(
+    x = (
+        df.copy()
+        if already_temporal
+        else normalize_race_input(
             df
         )
+    )
 
     x = x.copy()
 
     # ========================================================
-    # TAILLE DU PELOTON
+    # FIELD SIZE
     # ========================================================
 
     field = pd.to_numeric(
@@ -430,18 +483,14 @@ def make_features(
         errors="coerce",
     )
 
-    if field.notna().any():
-
-        default_field = (
-            field.median()
-        )
-
-    else:
-
-        default_field = max(
+    default_field = (
+        field.median()
+        if field.notna().any()
+        else max(
             len(x),
             2,
         )
+    )
 
     field = (
         field
@@ -462,9 +511,7 @@ def make_features(
             "odds"
         ],
         errors="coerce",
-    )
-
-    odds = odds.clip(
+    ).clip(
         lower=1.01
     )
 
@@ -517,7 +564,7 @@ def make_features(
     )
 
     # ========================================================
-    # POIDS RELATIF A LA COURSE
+    # POIDS
     # ========================================================
 
     weight = pd.to_numeric(
@@ -527,21 +574,19 @@ def make_features(
         errors="coerce",
     )
 
-    if "race_id" in x.columns:
-
-        race_groups = (
-            x[
-                "race_id"
-            ]
-            .astype(str)
+    race_groups = (
+        x[
+            "race_id"
+        ].astype(
+            str
         )
-
-    else:
-
-        race_groups = pd.Series(
+        if "race_id"
+        in x.columns
+        else pd.Series(
             "one",
             index=x.index,
         )
+    )
 
     weight_ref = (
         weight
@@ -553,15 +598,11 @@ def make_features(
         )
     )
 
-    if weight.notna().any():
-
-        global_weight = (
-            weight.median()
-        )
-
-    else:
-
-        global_weight = 57.0
+    global_weight = (
+        weight.median()
+        if weight.notna().any()
+        else 57.0
+    )
 
     weight_ref = (
         weight_ref
@@ -614,10 +655,6 @@ def make_features(
         3,
     )
 
-    # ========================================================
-    # TAILLE PELOTON NORMALISEE
-    # ========================================================
-
     field_norm = (
         (
             field
@@ -630,7 +667,136 @@ def make_features(
     )
 
     # ========================================================
-    # CREATION DATAFRAME
+    # AGE
+    # ========================================================
+
+    if (
+        "age"
+        in x.columns
+    ):
+
+        age = pd.to_numeric(
+            x[
+                "age"
+            ],
+            errors="coerce",
+        )
+
+    else:
+
+        age = pd.Series(
+            np.nan,
+            index=x.index,
+            dtype=float,
+        )
+
+    age_missing = (
+        age.isna()
+        .astype(
+            float
+        )
+    )
+
+    # 5 ans est proche de la médiane globale de nos données.
+    age_filled = (
+        age
+        .fillna(
+            5.0
+        )
+        .clip(
+            2,
+            15,
+        )
+    )
+
+    age_norm = (
+        (
+            age_filled
+            - 5.0
+        )
+        / 3.0
+    ).clip(
+        -1.5,
+        3.5,
+    )
+
+    # Age relatif aux adversaires de la course.
+    age_race_median = (
+        age
+        .groupby(
+            race_groups
+        )
+        .transform(
+            "median"
+        )
+    )
+
+    age_race_median = (
+        age_race_median
+        .fillna(
+            5.0
+        )
+    )
+
+    age_relative = (
+        (
+            age_filled
+            - age_race_median
+        )
+        / 3.0
+    ).clip(
+        -3,
+        3,
+    )
+
+    # ========================================================
+    # SEXE
+    # ========================================================
+
+    if (
+        "sex"
+        in x.columns
+    ):
+
+        sex_bucket = (
+            x[
+                "sex"
+            ]
+            .map(
+                _sex_bucket
+            )
+        )
+
+    else:
+
+        sex_bucket = pd.Series(
+            "UNKNOWN",
+            index=x.index,
+        )
+
+    sex_female = (
+        sex_bucket
+        == "FEMALE"
+    ).astype(
+        float
+    )
+
+    sex_gelding = (
+        sex_bucket
+        == "GELDING"
+    ).astype(
+        float
+    )
+
+    sex_known = (
+        sex_bucket
+        != "UNKNOWN"
+    ).astype(
+        float
+    )
+
+    # ========================================================
+    # OUTPUT
     # ========================================================
 
     out = pd.DataFrame(
@@ -672,9 +838,9 @@ def make_features(
         "field_size_norm"
     ] = field_norm
 
-    # ========================================================
-    # STATS HISTORIQUES
-    # ========================================================
+    # --------------------------------------------------------
+    # Helper historique
+    # --------------------------------------------------------
 
     def col_or_default(
         name: str,
@@ -849,10 +1015,41 @@ def make_features(
     )
 
     # ========================================================
-    # DISCIPLINE V4
+    # AGE / SEXE
     # ========================================================
 
-    if "discipline" in x.columns:
+    out[
+        "age_norm"
+    ] = age_norm
+
+    out[
+        "age_relative"
+    ] = age_relative
+
+    out[
+        "age_missing"
+    ] = age_missing
+
+    out[
+        "sex_female"
+    ] = sex_female
+
+    out[
+        "sex_gelding"
+    ] = sex_gelding
+
+    out[
+        "sex_known"
+    ] = sex_known
+
+    # ========================================================
+    # DISCIPLINE
+    # ========================================================
+
+    if (
+        "discipline"
+        in x.columns
+    ):
 
         discipline = (
             x[
@@ -873,27 +1070,37 @@ def make_features(
     is_plat = (
         discipline
         == "PLAT"
-    ).astype(float)
+    ).astype(
+        float
+    )
 
     is_autostart = (
         discipline
         == "AUTOSTART"
-    ).astype(float)
+    ).astype(
+        float
+    )
 
     is_volte = (
         discipline
         == "VOLTE"
-    ).astype(float)
+    ).astype(
+        float
+    )
 
     is_monte = (
         discipline
         == "MONTE"
-    ).astype(float)
+    ).astype(
+        float
+    )
 
     is_obstacle = (
         discipline
         == "OBSTACLE"
-    ).astype(float)
+    ).astype(
+        float
+    )
 
     out[
         "discipline_plat"
@@ -916,7 +1123,7 @@ def make_features(
     ] = is_obstacle
 
     # ========================================================
-    # INTERACTIONS PLAT
+    # PLAT
     # ========================================================
 
     out[
@@ -940,8 +1147,15 @@ def make_features(
         * distance_norm
     )
 
+    out[
+        "plat_age_norm"
+    ] = (
+        is_plat
+        * age_norm
+    )
+
     # ========================================================
-    # INTERACTIONS AUTOSTART
+    # AUTOSTART
     # ========================================================
 
     out[
@@ -965,8 +1179,15 @@ def make_features(
         * field_norm
     )
 
+    out[
+        "autostart_age_norm"
+    ] = (
+        is_autostart
+        * age_norm
+    )
+
     # ========================================================
-    # INTERACTIONS VOLTE
+    # VOLTE
     # ========================================================
 
     out[
@@ -983,8 +1204,15 @@ def make_features(
         * field_norm
     )
 
+    out[
+        "volte_age_norm"
+    ] = (
+        is_volte
+        * age_norm
+    )
+
     # ========================================================
-    # INTERACTIONS MONTE
+    # MONTE
     # ========================================================
 
     out[
@@ -1001,8 +1229,15 @@ def make_features(
         * distance_norm
     )
 
+    out[
+        "monte_age_norm"
+    ] = (
+        is_monte
+        * age_norm
+    )
+
     # ========================================================
-    # INTERACTIONS OBSTACLE
+    # OBSTACLE
     # ========================================================
 
     out[
@@ -1019,15 +1254,20 @@ def make_features(
         * distance_norm
     )
 
-    # Ordre déterministe indispensable pour
-    # le stockage du modèle JSON.
+    out[
+        "obstacle_age_norm"
+    ] = (
+        is_obstacle
+        * age_norm
+    )
+
     return out[
         FEATURE_COLUMNS
     ]
 
 
 # ============================================================
-# SNAPSHOT POUR UNE COURSE FUTURE
+# SNAPSHOT HISTORIQUE
 # ============================================================
 
 def entity_snapshot_from_history(
@@ -1138,7 +1378,7 @@ def entity_snapshot_from_history(
 
 
 # ============================================================
-# ENRICHISSEMENT LIVE
+# COURSE LIVE
 # ============================================================
 
 def enrich_live_race(
@@ -1202,6 +1442,7 @@ def enrich_live_race(
         if snap[
             entity
         ].empty:
+
             continue
 
         keys = out[

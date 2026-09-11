@@ -101,10 +101,10 @@ def serialize_model(
     artifact = {
 
         "schema_version":
-            4,
+    5,
 
-        "model_family":
-            "HorseProno V4 discipline-aware",
+"model_family":
+    "HorseProno V4.1 age-sex discipline-aware",
 
         "feature_columns":
             FEATURE_COLUMNS,

@@ -360,7 +360,7 @@ def load_stored_models(
 
         raise ValueError(
             "Artefact incompatible avec "
-            "les features HorseProno V4."
+            "les features HorseProno V4.1."
         )
 
     schema_version = (
@@ -369,7 +369,7 @@ def load_stored_models(
         )
     )
 
-    if schema_version != 4:
+    if schema_version != 5:
 
         raise ValueError(
             "Artefact incompatible avec "
@@ -564,11 +564,11 @@ def build_model_record(
     return {
 
         "model_name":
-            "horseprono_v4",
+            "horseprono_v4_1",
 
         "model_type":
             (
-                "discipline_aware_"
+                "age_sex_discipline_aware_"
                 "bradley_terry_"
                 "logistic_calibrated"
             ),

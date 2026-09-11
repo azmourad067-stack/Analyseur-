@@ -919,23 +919,25 @@ def _get_training_history_paginated(
     if not all_rows:
         return pd.DataFrame(
             columns=[
-                "race_id",
-                "race_date",
-                "discipline",
-                "hippodrome",
-                "distance",
-                "terrain",
-                "field_size",
-                "horse_number",
-                "horse_name",
-                "jockey",
-                "trainer",
-                "odds",
-                "draw",
-                "weight",
-                "recent_form",
-                "finish_position",
-            ]
+    "race_id",
+    "race_date",
+    "discipline",
+    "hippodrome",
+    "distance",
+    "terrain",
+    "field_size",
+    "horse_number",
+    "horse_name",
+    "jockey",
+    "trainer",
+    "odds",
+    "draw",
+    "weight",
+    "age",
+    "sex",
+    "recent_form",
+    "finish_position",
+]
         )
 
     return pd.DataFrame(all_rows)

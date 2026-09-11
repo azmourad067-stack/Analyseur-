@@ -12,6 +12,10 @@ sys.path.insert(
     ),
 )
 
+from app_core.backtest_v2 import (
+    build_advanced_backtest,
+)
+
 from app_core.db import (
     activate_model,
     get_latest_active_model,
@@ -25,10 +29,6 @@ from app_core.model_store import build_model_record
 
 
 def main() -> None:
-    """
-    Entraîne le modèle HorseProno à partir
-    de l'historique stocké dans Supabase.
-    """
 
     started_at = datetime.now(
         timezone.utc
@@ -37,10 +37,6 @@ def main() -> None:
     print("=" * 60)
     print("HORSEPRONO - TRAINING")
     print("=" * 60)
-
-    # --------------------------------------------------------
-    # 1. Chargement historique
-    # --------------------------------------------------------
 
     print(
         "Chargement de l'historique "
@@ -75,9 +71,9 @@ def main() -> None:
             f"{history['race_date'].max()}"
         )
 
-    # --------------------------------------------------------
-    # 2. Entraînement
-    # --------------------------------------------------------
+    # ========================================================
+    # ENTRAINEMENT
+    # ========================================================
 
     print()
     print(
@@ -95,20 +91,115 @@ def main() -> None:
         "Entraînement terminé."
     )
 
-    # --------------------------------------------------------
-    # 3. Création artefact
-    # --------------------------------------------------------
+    # ========================================================
+    # BACKTEST V2
+    # ========================================================
+
+    print()
+    print("=" * 60)
+    print("BACKTEST V2")
+    print("=" * 60)
+
+    advanced = (
+        build_advanced_backtest(
+            model,
+            history,
+        )
+    )
+
+    metrics[
+        "backtest_v2"
+    ] = advanced
+
+    model.metrics = metrics
+
+    if advanced:
+
+        overall = advanced.get(
+            "overall",
+            {},
+        )
+
+        print(
+            "Courses test :",
+            overall.get(
+                "races"
+            ),
+        )
+
+        print(
+            "Top 1 :",
+            overall.get(
+                "top1_accuracy"
+            ),
+        )
+
+        print(
+            "Gagnant dans Top 2 :",
+            overall.get(
+                "winner_in_top2"
+            ),
+        )
+
+        print(
+            "Gagnant dans Top 3 :",
+            overall.get(
+                "winner_in_top3"
+            ),
+        )
+
+        print(
+            "Gagnant dans Top 5 :",
+            overall.get(
+                "winner_in_top5"
+            ),
+        )
+
+        print(
+            "Trio complet Top 3 :",
+            overall.get(
+                "trio_complete_top3"
+            ),
+        )
+
+        print(
+            "Trio complet couvert Top 5 :",
+            overall.get(
+                "trio_complete_top5"
+            ),
+        )
+
+        print(
+            "Podium moyen capturé Top 3 :",
+            overall.get(
+                "avg_podium_captured_top3"
+            ),
+        )
+
+        print(
+            "ECE calibration :",
+            advanced
+            .get(
+                "calibration",
+                {},
+            )
+            .get(
+                "expected_calibration_error"
+            ),
+        )
+
+    # ========================================================
+    # ARTEFACT
+    # ========================================================
 
     record = build_model_record(
         model,
         metrics,
     )
 
-    previous = get_latest_active_model()
-
-    # --------------------------------------------------------
-    # 4. Vérification modèle identique
-    # --------------------------------------------------------
+    previous = (
+        get_latest_active_model()
+    )
 
     if (
         previous
@@ -136,9 +227,9 @@ def main() -> None:
 
         return
 
-    # --------------------------------------------------------
-    # 5. Sauvegarde version
-    # --------------------------------------------------------
+    # ========================================================
+    # SAUVEGARDE
+    # ========================================================
 
     print()
     print(
@@ -146,8 +237,10 @@ def main() -> None:
         "dans Supabase..."
     )
 
-    created = save_model_version(
-        record
+    created = (
+        save_model_version(
+            record
+        )
     )
 
     model_id = int(
@@ -159,10 +252,6 @@ def main() -> None:
         f"{model_id}"
     )
 
-    # --------------------------------------------------------
-    # 6. Activation
-    # --------------------------------------------------------
-
     activate_model(
         model_id
     )
@@ -172,20 +261,19 @@ def main() -> None:
         f"{model_id}"
     )
 
-    # --------------------------------------------------------
-    # 7. Backtest
-    # --------------------------------------------------------
+    # ========================================================
+    # BACKTEST DATABASE
+    # ========================================================
 
     finished_at = datetime.now(
         timezone.utc
     )
 
     notes = (
-        "Backtest chronologique HorseProno V3. "
+        "Backtest chronologique HorseProno V3 "
+        "+ Backtest V2. "
         f"Test du {metrics.get('test_start')} "
-        f"au {metrics.get('test_end')}. "
-        f"{metrics.get('backtest_races', 0)} "
-        "courses de test."
+        f"au {metrics.get('test_end')}."
     )
 
     save_backtest_run(
@@ -211,13 +299,13 @@ def main() -> None:
         "Backtest enregistré."
     )
 
-    # --------------------------------------------------------
-    # 8. Résultats
-    # --------------------------------------------------------
+    # ========================================================
+    # RESULTATS
+    # ========================================================
 
     print()
     print("=" * 60)
-    print("METRICS")
+    print("METRICS COMPLETES")
     print("=" * 60)
 
     print(
@@ -230,10 +318,12 @@ def main() -> None:
 
     print()
     print("=" * 60)
+
     print(
         f"MODÈLE {model_id} "
         "ENTRAÎNÉ ET ACTIVÉ"
     )
+
     print("=" * 60)
 
 

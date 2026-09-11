@@ -74,6 +74,33 @@ def get_participants(
 # ============================================================
 
 def _as_int(value):
+    def _weight_kg(value):
+    """
+    Convertit les poids PMU vers des kilogrammes.
+
+    Exemples observés :
+        580 -> 58.0 kg
+        585 -> 58.5 kg
+        550 -> 55.0 kg
+    """
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if value <= 0:
+        return None
+
+    # Les poids PMU observés sont exprimés
+    # en dixièmes de kilogramme.
+    if value >= 200:
+        value = value / 10.0
+
+    if not 30 <= value <= 100:
+        return None
+
+    return round(value, 1)
     """
     Convertit une valeur en entier de façon sûre.
     """
@@ -519,12 +546,51 @@ def participants_to_df(
         # Poids
         # ----------------------------------------------------
 
-        weight = _pick(
-            participant,
-            "poids",
-            "poidsCheval",
-            default=None,
-        )
+       age = _as_int(
+    _pick(
+        participant,
+        "age",
+        default=None,
+    )
+)
+
+sex = _pick(
+    participant,
+    "sexe",
+    "sex",
+    default="",
+)
+
+condition_weight = _weight_kg(
+    _pick(
+        participant,
+        "poidsConditionMonte",
+        default=None,
+    )
+)
+
+handicap_weight = _weight_kg(
+    _pick(
+        participant,
+        "handicapPoids",
+        default=None,
+    )
+)
+
+generic_weight = _weight_kg(
+    _pick(
+        participant,
+        "poids",
+        "poidsCheval",
+        default=None,
+    )
+)
+
+weight = (
+    condition_weight
+    or handicap_weight
+    or generic_weight
+)
 
         # ----------------------------------------------------
         # Musique
@@ -644,7 +710,8 @@ def participants_to_df(
 
                 "draw": draw,
 
-                "weight": weight,
+                "weight": weight, "age": age,
+"sex": sex,
 
                 "recent_form": recent_form,
 

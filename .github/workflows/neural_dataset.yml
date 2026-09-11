@@ -22,8 +22,8 @@ jobs:
           pip install numpy pandas supabase streamlit
 
       - name: Prepare Neural V1 dataset
-      env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      run: |
-       python -u -m neural.prepare_dataset
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python -u -m neural.prepare_dataset

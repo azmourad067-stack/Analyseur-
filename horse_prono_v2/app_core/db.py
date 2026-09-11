@@ -710,11 +710,22 @@ def list_races(
 def get_participants(
     race_id: str | int,
 ) -> pd.DataFrame:
+    """
+    Charge les participants ET les métadonnées de leur course.
 
-    query = (
+    Cela permet au modèle V4 d'avoir discipline,
+    distance, hippodrome et taille du peloton
+    lors d'une prédiction depuis Supabase.
+    """
+
+    participant_response = (
         _client()
-        .table("participants")
-        .select("*")
+        .table(
+            "participants"
+        )
+        .select(
+            "*"
+        )
         .eq(
             "race_id",
             race_id,
@@ -722,13 +733,131 @@ def get_participants(
         .order(
             "horse_number"
         )
+        .execute()
     )
 
-    return pd.DataFrame(
-        _rows(
-            query.execute()
-        )
+    rows = _rows(
+        participant_response
     )
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(
+        rows
+    )
+
+    # --------------------------------------------------------
+    # Métadonnées course
+    # --------------------------------------------------------
+
+    race_response = (
+        _client()
+        .table(
+            "races"
+        )
+        .select(
+            "id,"
+            "external_id,"
+            "race_date,"
+            "discipline,"
+            "hippodrome,"
+            "distance_m,"
+            "terrain,"
+            "field_size"
+        )
+        .eq(
+            "id",
+            race_id,
+        )
+        .limit(1)
+        .execute()
+    )
+
+    race_rows = _rows(
+        race_response
+    )
+
+    if race_rows:
+
+        race = race_rows[0]
+
+        out[
+            "race_id"
+        ] = (
+            race.get(
+                "external_id"
+            )
+            or str(
+                race_id
+            )
+        )
+
+        out[
+            "race_date"
+        ] = race.get(
+            "race_date"
+        )
+
+        out[
+            "discipline"
+        ] = race.get(
+            "discipline"
+        )
+
+        out[
+            "hippodrome"
+        ] = race.get(
+            "hippodrome"
+        )
+
+        out[
+            "distance"
+        ] = race.get(
+            "distance_m"
+        )
+
+        out[
+            "terrain"
+        ] = race.get(
+            "terrain"
+        )
+
+        out[
+            "field_size"
+        ] = race.get(
+            "field_size"
+        )
+
+    # --------------------------------------------------------
+    # Noms attendus par HorseProno
+    # --------------------------------------------------------
+
+    if "jockey_name" in out.columns:
+
+        out[
+            "jockey"
+        ] = out[
+            "jockey_name"
+        ]
+
+    if "trainer_name" in out.columns:
+
+        out[
+            "trainer"
+        ] = out[
+            "trainer_name"
+        ]
+
+    if "weight_kg" in out.columns:
+
+        out[
+            "weight"
+        ] = out[
+            "weight_kg"
+        ]
+
+    return out
 
 
 # ============================================================

@@ -35,7 +35,16 @@ from app_core.db import (
     upsert_races,
 )
 from app_core.features import entity_snapshot_from_history
-from app_core.forward_utils import course_objects, course_start_time
+from app_core.forward_utils import (
+    course_objects,
+    course_start_time,
+    non_runner_numbers,
+)
+
+from neural.forward_capture import (
+    capture_forward_comparison,
+    load_forward_neural,
+)
 from app_core.model import HorseRacingModel
 from app_core.pmu import (
     get_participants,

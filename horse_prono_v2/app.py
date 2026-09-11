@@ -215,7 +215,7 @@ else:
                 race = enrich_live_race(race, h)
             except Exception as exc:
                 st.caption(f"Enrichissement historique non disponible : {exc}")
-        st.dataframe(race[["horse_number", "horse_name", "jockey", "trainer", "odds", "draw", "weight", "recent_form"]], width="stretch", hide_index=True)
+        st.dataframe(race[["horse_number", "horse_name", "age", "sex", "jockey", "trainer", "odds", "draw", "weight", "recent_form"]], width="stretch", hide_index=True)
         if st.button("🧠 Calculer le pronostic", type="primary"):
             try:
                 result = model.predict(race)

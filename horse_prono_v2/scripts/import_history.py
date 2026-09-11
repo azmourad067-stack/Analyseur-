@@ -46,8 +46,20 @@ def import_day(target_date: date) -> tuple[int, int]:
                 "field_size", "reunion", "course_number"]].drop_duplicates("race_id").copy()
     races["source"] = "pmu"
     races["status"] = "finished" if df["finish_position"].notna().any() else "scheduled"
-    pcols = ["race_id", "horse_number", "horse_name", "jockey", "trainer", "odds", "draw",
-             "weight", "recent_form", "finish_position"]
+   pcols = [
+    "race_id",
+    "horse_number",
+    "horse_name",
+    "jockey",
+    "trainer",
+    "odds",
+    "draw",
+    "weight",
+    "age",
+    "sex",
+    "recent_form",
+    "finish_position",
+]
     participants = df[pcols].copy()
     n_races = upsert_races(races)
     n_participants = upsert_participants(participants)

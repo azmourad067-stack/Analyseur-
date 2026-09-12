@@ -39,7 +39,7 @@ jobs:
 
           echo "✅ Neural V1 files found"
 
-           - name: Run Simple Place backtest
+      - name: Run Simple Place backtest
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}

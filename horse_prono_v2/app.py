@@ -510,7 +510,7 @@ with tab_prono:
     race_id = None
 
 
-    # ========================================================
+        # ========================================================
     # SOURCE SUPABASE
     # ========================================================
 
@@ -540,29 +540,27 @@ with tab_prono:
                 options = races.apply(
                     lambda row: (
                         f"{row.get('race_date')} · "
-                        f"R{row.get('reunion') or '?'}"
-                        f"C{row.get('course_number') or '?'} · "
+                        f"R{row.get('meeting_number') or '?'}"
+                        f"C{row.get('race_number') or '?'} · "
                         f"{row.get('hippodrome', 'INCONNU')} · "
-                        f"{row.get('race_id')}"
+                        f"{row.get('external_id', '?')}"
                     ),
                     axis=1,
                 ).tolist()
 
                 ix = st.selectbox(
                     "Course",
-                    range(
-                        len(options)
-                    ),
-                    format_func=lambda i: (
-                        options[i]
-                    ),
+                    range(len(options)),
+                    format_func=lambda i: options[i],
                 )
 
-                race_id = str(
-                    races.iloc[ix][
-                        "race_id"
-                    ]
+                # IMPORTANT :
+                # races.id = identifiant interne Supabase
+                selected_race_id = int(
+                    races.iloc[ix]["id"]
                 )
+
+                race_id = selected_race_id
 
                 if st.button(
                     "Charger les partants",
@@ -571,10 +569,8 @@ with tab_prono:
 
                     try:
 
-                        race = (
-                            cached_participants(
-                                race_id
-                            )
+                        race = cached_participants(
+                            selected_race_id
                         )
 
                         st.session_state[
@@ -583,7 +579,7 @@ with tab_prono:
 
                         st.session_state[
                             "selected_race_id"
-                        ] = race_id
+                        ] = selected_race_id
 
                     except Exception as exc:
 
@@ -596,16 +592,13 @@ with tab_prono:
                     st.session_state.get(
                         "selected_race_id"
                     )
-                    == race_id
+                    == selected_race_id
                 ):
 
-                    race = (
-                        st.session_state.get(
-                            "selected_race",
-                            pd.DataFrame(),
-                        )
+                    race = st.session_state.get(
+                        "selected_race",
+                        pd.DataFrame(),
                     )
-
 
     # ========================================================
     # SOURCE API PMU

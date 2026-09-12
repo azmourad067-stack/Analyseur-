@@ -1,0 +1,58 @@
+name: Neural Simple Place Backtest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: horse_prono_v2/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r horse_prono_v2/requirements.txt
+          pip install joblib
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Check Neural V1 files
+        run: |
+          echo "=========================================="
+          echo "CHECK NEURAL V1"
+          echo "=========================================="
+
+          test -f models/neural/horseprono_neural_v1.pt
+          test -f models/neural/horseprono_neural_v1_scaler.joblib
+          test -f models/neural/horseprono_neural_v1_features.json
+
+          echo "✅ Neural V1 files found"
+
+      - name: Run Simple Place backtest
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+        run: |
+          python -u neural/backtest_simple_place.py \
+            --start 2026-08-25 \
+            --end 2026-09-12
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neural-simple-place-results
+          path: artifacts/simple_place/
+          if-no-files-found: warn

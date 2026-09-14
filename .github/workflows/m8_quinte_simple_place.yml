@@ -1,0 +1,63 @@
+name: M8 Quinté Simple Placé Backtest
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: horse_prono_v2/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r horse_prono_v2/requirements.txt
+          pip install pandas numpy requests supabase scikit-learn
+
+      - name: Check backtest script
+        run: |
+          test -f horse_prono_v2/scripts/backtest_quinte_simple_place_m8.py
+          echo "✅ Script M8 Quinté trouvé"
+
+      - name: Run M8 Quinté Simple Placé backtest
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+        run: |
+          python -u horse_prono_v2/scripts/backtest_quinte_simple_place_m8.py
+
+      - name: Show results
+        if: always()
+        run: |
+          echo "=============================================="
+          echo "M8 QUINTE SIMPLE PLACE RESULTS"
+          echo "=============================================="
+
+          if [ -d "horse_prono_v2/artifacts/quinte_simple_place_m8" ]; then
+            ls -lh horse_prono_v2/artifacts/quinte_simple_place_m8/
+          else
+            echo "Dossier de résultats absent"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m8-quinte-simple-place-results
+          path: horse_prono_v2/artifacts/quinte_simple_place_m8/
+          if-no-files-found: warn
+          retention-days: 30

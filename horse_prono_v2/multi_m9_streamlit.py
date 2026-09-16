@@ -27,7 +27,7 @@ from supabase import create_client
 # =============================================================================
 
 APP_NAME = "HorseProno Multi M9"
-APP_VERSION = "M9-MULTI-V3"
+APP_VERSION = "M9-MULTI-V4"
 
 PMU_BASE_URL = "https://online.turfinfo.api.pmu.fr/rest/client/1"
 REQUEST_TIMEOUT = 25
@@ -78,9 +78,9 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🏇 HorseProno Multi M9 — V3")
+st.title("🏇 HorseProno Multi M9 — V4")
 st.caption(
-    "Méta-modèle spécialisé Multi. V3 reconstruit la cohorte historique exacte de 84 "
+    "Méta-modèle spécialisé Multi. V4 reconstruit la cohorte historique exacte de 84 "
     "courses avant toute optimisation."
 )
 
@@ -636,8 +636,18 @@ def historical_finish_targets(
     participants: pd.DataFrame,
 ) -> dict[int, frozenset[int]]:
     """
-    Reproduit le critère d'exploitabilité de l'analyse historique initiale :
-    les quatre positions d'arrivée 1 à 4 doivent être présentes en base.
+    Reproduit exactement la logique de l'analyse historique initiale :
+    on trie les arrivées positives et on prend les 4 premiers chevaux,
+    y compris en cas d'ex-aequo.
+
+    Exemple réel du 12/09/2026 R4C4 :
+        3 -> 1er
+        6 -> 1er
+        5 -> 3e
+        9 -> 4e
+
+    L'ancienne V3 exigeait à tort les positions distinctes {1,2,3,4},
+    ce qui rejetait cette course et donnait 83 au lieu de 84.
     """
     result: dict[int, frozenset[int]] = {}
 
@@ -667,32 +677,28 @@ def historical_finish_targets(
     data = data[
         data["race_id"].notna()
         & data["horse_number"].notna()
-        & data["finish_position"].between(1, 4)
+        & data["finish_position"].notna()
+        & data["finish_position"].gt(0)
     ].copy()
 
     for race_id, group in data.groupby("race_id"):
-        # Une position 1,2,3,4 chacune, donc exactement 4 chevaux exploitables.
-        positions = set(
-            int(x)
-            for x in group["finish_position"].tolist()
-        )
-
-        if positions != {1, 2, 3, 4}:
-            continue
-
         ordered = group.sort_values(
-            ["finish_position", "horse_number"]
+            ["finish_position", "horse_number"],
+            ascending=[True, True],
         )
 
-        if len(ordered) != 4:
+        top4 = ordered.head(4)
+
+        if len(top4) != 4:
             continue
 
         result[int(race_id)] = frozenset(
             int(x)
-            for x in ordered["horse_number"].tolist()
+            for x in top4["horse_number"].tolist()
         )
 
     return result
+
 
 
 def load_predictions(race_ids: list[int]) -> pd.DataFrame:
@@ -1252,7 +1258,7 @@ def optimize(
 
     progress = st.progress(
         0.0,
-        text="Optimisation M9 V3…",
+        text="Optimisation M9 V4…",
     )
 
     best_weights = None
@@ -1312,7 +1318,7 @@ def optimize(
             progress.progress(
                 i / total,
                 text=(
-                    f"Optimisation M9 V3 : "
+                    f"Optimisation M9 V4 : "
                     f"{i:,}/{total:,}"
                 ),
             )
@@ -1772,7 +1778,7 @@ def future_data(
 # =============================================================================
 
 with st.sidebar:
-    st.header("⚙️ Multi M9 V3")
+    st.header("⚙️ Multi M9 V4")
     st.write(f"**Version :** `{APP_VERSION}`")
     st.write("**Model #8 :** gelé")
     st.write("**Neural #9 :** gelé")
@@ -1783,8 +1789,8 @@ with st.sidebar:
     )
     st.write("**Cohorte attendue :** 84")
 
-    if "m9v2" in st.session_state:
-        cal = st.session_state["m9v3"]
+    if "m9v4" in st.session_state:
+        cal = st.session_state["m9v4"]
 
         if cal["lock_ok"]:
             st.success(
@@ -1798,7 +1804,7 @@ with st.sidebar:
 
 tab_cal, tab_live, tab_method = st.tabs(
     [
-        "🧪 Calibration exacte 84 — V3",
+        "🧪 Calibration exacte 84 — V4",
         "🎯 Pronostics Multi",
         "📐 Méthode",
     ]
@@ -1811,23 +1817,23 @@ with tab_cal:
     )
 
     st.info(
-        "V3 n'utilise plus finish_position Supabase pour définir la cible. "
+        "V4 reconstruit la cohorte initiale tout en gérant les ex-aequo. "
         "Elle relit les rapports définitifs PMU et extrait la combinaison Multi gagnante."
     )
 
     if st.button(
-        "🚀 Reconstruire les 84 et calibrer M9 V3",
+        "🚀 Reconstruire les 84 et calibrer M9 V4",
         type="primary",
         use_container_width=True,
     ):
         try:
-            st.session_state["m9v3"] = (
+            st.session_state["m9v4"] = (
                 run_calibration()
             )
         except Exception as exc:
             st.exception(exc)
 
-    cal = st.session_state.get("m9v3")
+    cal = st.session_state.get("m9v4")
 
     if cal is not None:
         pmu_all = cal["pmu_all"]
@@ -1899,7 +1905,7 @@ with tab_cal:
                     "Top7 contient les 4": cal["neural"]["hits7"],
                 },
                 {
-                    "Stratégie": "🏇 Multi M9 V3 optimisé",
+                    "Stratégie": "🏇 Multi M9 V4 optimisé",
                     "Multi4": cal["optimized"]["hits4"],
                     "Top5 contient les 4": cal["optimized"]["hits5"],
                     "Top6 contient les 4": cal["optimized"]["hits6"],
@@ -1936,7 +1942,7 @@ with tab_cal:
             )
 
             st.success(
-                f"🔒 Calibration cohérente : M9 V3 gagne {gain:+d} "
+                f"🔒 Calibration cohérente : M9 V4 gagne {gain:+d} "
                 "Multi4 sur la cohorte de calibration par rapport au 5/84 de référence."
             )
         else:
@@ -2014,7 +2020,7 @@ with tab_cal:
         }
 
         st.download_button(
-            "⬇️ Télécharger la configuration M9 V3",
+            "⬇️ Télécharger la configuration M9 V4",
             data=json.dumps(
                 config,
                 ensure_ascii=False,
@@ -2030,7 +2036,7 @@ with tab_cal:
 with tab_live:
     st.subheader("🎯 Pronostics Multi")
 
-    cal = st.session_state.get("m9v3")
+    cal = st.session_state.get("m9v4")
 
     if cal is None:
         st.info(
@@ -2180,7 +2186,7 @@ with tab_live:
 
 
 with tab_method:
-    st.subheader("📐 Pourquoi cette V3 ?")
+    st.subheader("📐 Pourquoi cette V4 ?")
 
     st.markdown(
         """
@@ -2192,14 +2198,17 @@ Les exports V1 et V2 ont permis de reconstruire précisément la cohorte initial
   Supabase **et** les prédictions gelées M8 + Neural disponibles.
 
 Cette intersection est exactement le bloc historique utilisé dans notre première
-analyse. Sur ces 84 courses, le classement **M8 place** doit reproduire :
+analyse. V4 gère aussi les **ex-aequo d'arrivée**, ce qui réintègre la course
+R4C4 du 12/09 (deux chevaux classés 1ers). Sur ces 84 courses, le classement
+**M8 place** doit reproduire :
 
 - **5/84** avec 4 chevaux;
 - **15/84** avec 5 chevaux;
 - **23/84** avec 6 chevaux.
 
-V3 exige aussi que le Top4 du rapport PMU soit identique au Top4 enregistré
-dans Supabase. Si ce contrôle échoue, la course est rejetée.
+V4 exige aussi que le Top4 du rapport PMU soit identique aux quatre premiers
+chevaux de l'arrivée Supabase après tri, **sans exiger des rangs distincts 1-2-3-4**.
+Cela respecte les dead-heats / ex-aequo.
 
 Une fois les 84 retrouvées, l'optimiseur teste les **10 626** combinaisons de
 poids et cherche en priorité à maximiser le nombre de Multi4 complets.

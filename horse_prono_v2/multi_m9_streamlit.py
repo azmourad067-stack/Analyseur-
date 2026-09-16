@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import os
 from datetime import date, timedelta
@@ -15,24 +14,25 @@ from supabase import create_client
 
 
 # =============================================================================
-# HORSEPRONO MULTI M9
-# Méta-modèle spécialisé Multi, calibré sur les 84 courses Multi du 12-15/09/2026
+# HORSEPRONO MULTI M9 — V2
 #
-# IMPORTANT
-# - Ne modifie PAS le Model #8 gelé.
-# - Ne modifie PAS le Neural #9 gelé.
-# - "Multi M9" est un méta-modèle Streamlit, pas l'ID Supabase #9.
-# - Les 84 courses sont un jeu de CALIBRATION, pas un test indépendant.
-# - Les courses futures constituent la vraie validation.
+# Correction principale :
+#   - la cohorte de calibration n'est PLUS définie par "tout texte contenant MULTI"
+#   - elle est définie par les rapports définitifs PMU réellement exploitables
+#   - la cible Top4 provient du rapport Multi PMU, pas de finish_position Supabase
+#   - on audite M8 rank_win ET M8 rank_place pour retrouver la référence 5/84,15/84,23/84
+#
+# Les 84 courses 12→15/09/2026 sont une cohorte de calibration.
+# Les courses suivantes sont la vraie validation forward.
 # =============================================================================
 
 APP_NAME = "HorseProno Multi M9"
-APP_VERSION = "M9-MULTI-V1"
+APP_VERSION = "M9-MULTI-V2"
 
 PMU_BASE_URL = "https://online.turfinfo.api.pmu.fr/rest/client/1"
 REQUEST_TIMEOUT = 25
 HEADERS = {
-    "User-Agent": "HorsePronoMultiM9/1.0 (+https://streamlit.io)",
+    "User-Agent": "HorsePronoMultiM9/2.0 (+https://streamlit.io)",
     "Accept": "application/json",
 }
 
@@ -49,16 +49,13 @@ NEURAL_HASH = (
 CALIBRATION_START = date(2026, 9, 12)
 CALIBRATION_END = date(2026, 9, 15)
 
-EXPECTED_MULTI_SUPPORTS = 84
-
-# Sanity checks issus du backtest Multi M8 déjà mesuré.
-EXPECTED_M8_HITS = {
+EXPECTED_COHORT = 84
+EXPECTED_M8 = {
     4: 5,
     5: 15,
     6: 23,
 }
 
-# 5 signaux => 10 626 combinaisons avec un pas de 0.05.
 GRID_STEP = 0.05
 GRID_UNITS = int(round(1.0 / GRID_STEP))
 
@@ -81,15 +78,15 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🏇 HorseProno Multi M9")
+st.title("🏇 HorseProno Multi M9 — V2")
 st.caption(
-    "Méta-modèle Multi : Model #8 + Neural #9 + marché + consensus. "
-    "Calibration figée sur les 84 courses Multi du 12 au 15 septembre 2026."
+    "Méta-modèle spécialisé Multi. V2 reconstruit d'abord exactement la cohorte "
+    "PMU à partir des rapports définitifs, puis calibre le sélecteur."
 )
 
 
 # =============================================================================
-# OUTILS GÉNÉRAUX
+# UTILS
 # =============================================================================
 
 def _secret(name: str) -> str | None:
@@ -109,21 +106,21 @@ def _rows(response) -> list[dict]:
     return list(getattr(response, "data", None) or [])
 
 
+def _safe_int(value: Any) -> int | None:
+    try:
+        if pd.isna(value):
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         value = float(value)
         if not np.isfinite(value):
             return None
         return value
-    except Exception:
-        return None
-
-
-def _safe_int(value: Any) -> int | None:
-    try:
-        if pd.isna(value):
-            return None
-        return int(value)
     except Exception:
         return None
 
@@ -136,24 +133,20 @@ def _daterange(start: date, end: date):
 
 
 @st.cache_resource(show_spinner=False)
-def get_supabase_client():
+def get_client():
     url = _secret("SUPABASE_URL")
-    key = (
-        _secret("SUPABASE_SERVICE_KEY")
-        or _secret("SUPABASE_KEY")
-    )
+    key = _secret("SUPABASE_SERVICE_KEY") or _secret("SUPABASE_KEY")
 
     if not url or not key:
         raise RuntimeError(
-            "Secrets absents : ajoute SUPABASE_URL et SUPABASE_SERVICE_KEY "
-            "dans Streamlit Secrets."
+            "Secrets absents : SUPABASE_URL et SUPABASE_SERVICE_KEY."
         )
 
     return create_client(url, key)
 
 
 # =============================================================================
-# PMU : PROGRAMME ET DÉTECTION DES COURSES MULTI
+# PMU — PROGRAMME
 # =============================================================================
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -170,11 +163,31 @@ def get_programme(day_iso: str) -> dict:
     return response.json()
 
 
-def _as_int(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def get_final_reports(
+    day_iso: str,
+    reunion: int,
+    course: int,
+) -> dict:
+    day = date.fromisoformat(day_iso)
+    d = day.strftime("%d%m%Y")
+
+    url = (
+        f"{PMU_BASE_URL}/programme/{d}"
+        f"/R{reunion}/C{course}/rapports-definitifs"
+    )
+
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        params={
+            "combinaisonEnTableau": "true",
+            "specialisation": "INTERNET",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def _find_reunions(obj: Any) -> list[dict]:
@@ -197,105 +210,62 @@ def _find_reunions(obj: Any) -> list[dict]:
     return []
 
 
-def course_objects(programme: Any) -> list[dict]:
-    if not isinstance(programme, dict):
-        return []
+def _course_number(course_obj: dict) -> int | None:
+    return _safe_int(
+        course_obj.get("numOrdre")
+        or course_obj.get("numCourse")
+        or course_obj.get("numOfficiel")
+        or course_obj.get("numero")
+    )
 
-    root = programme.get("programme")
-    if not isinstance(root, dict):
-        root = programme
 
-    output: list[dict] = []
+def _meeting_number(reunion_obj: dict) -> int | None:
+    return _safe_int(
+        reunion_obj.get("numOfficiel")
+        or reunion_obj.get("numReunion")
+        or reunion_obj.get("numReunionProgramme")
+        or reunion_obj.get("numero")
+    )
 
-    for reunion_obj in _find_reunions(root):
-        reunion = _as_int(
-            reunion_obj.get("numOfficiel")
-            or reunion_obj.get("numReunion")
-            or reunion_obj.get("numReunionProgramme")
-            or reunion_obj.get("numero")
+
+def _hippodrome(reunion_obj: dict) -> str:
+    value = reunion_obj.get("hippodrome")
+
+    if isinstance(value, dict):
+        return str(
+            value.get("libelleCourt")
+            or value.get("libelleLong")
+            or value.get("nom")
+            or "INCONNU"
         )
-        if reunion is None:
-            continue
 
-        hippodrome_obj = reunion_obj.get("hippodrome")
-        if isinstance(hippodrome_obj, dict):
-            hippodrome = (
-                hippodrome_obj.get("libelleCourt")
-                or hippodrome_obj.get("libelleLong")
-                or hippodrome_obj.get("nom")
-                or "INCONNU"
-            )
-        else:
-            hippodrome = str(hippodrome_obj or "INCONNU")
-
-        courses = reunion_obj.get("courses")
-        if not isinstance(courses, list):
-            continue
-
-        for course_obj in courses:
-            if not isinstance(course_obj, dict):
-                continue
-
-            course = _as_int(
-                course_obj.get("numOrdre")
-                or course_obj.get("numCourse")
-                or course_obj.get("numOfficiel")
-                or course_obj.get("numero")
-            )
-            if course is None:
-                continue
-
-            label = (
-                course_obj.get("libelle")
-                or course_obj.get("nom")
-                or course_obj.get("libelleCourt")
-                or f"Course {course}"
-            )
-
-            field_size = _as_int(
-                course_obj.get("nombreDeclaresPartants")
-                or course_obj.get("nombrePartants")
-            )
-
-            output.append(
-                {
-                    "reunion": reunion,
-                    "course": course,
-                    "hippodrome_pmu": str(hippodrome),
-                    "label_pmu": str(label),
-                    "field_size_pmu": field_size,
-                    "raw": course_obj,
-                }
-            )
-
-    return output
+    return str(value or "INCONNU")
 
 
-def _collect_strings(obj: Any) -> list[str]:
-    values: list[str] = []
+def _label(course_obj: dict, course: int) -> str:
+    return str(
+        course_obj.get("libelle")
+        or course_obj.get("nom")
+        or course_obj.get("libelleCourt")
+        or f"Course {course}"
+    )
 
+
+def _iter_dicts(obj: Any):
     if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key in {
-                "codePari",
-                "typePari",
-                "libelle",
-                "libelleCourt",
-                "libelleLong",
-                "code",
-                "type",
-            } and value is not None:
-                values.append(str(value))
-            values.extend(_collect_strings(value))
-
+        yield obj
+        for value in obj.values():
+            yield from _iter_dicts(value)
     elif isinstance(obj, list):
         for value in obj:
-            values.extend(_collect_strings(value))
-
-    return values
+            yield from _iter_dicts(value)
 
 
-def multi_bet_codes(course_obj: dict) -> list[str]:
+def exact_multi_codes(course_obj: dict) -> list[str]:
+    """
+    IMPORTANT : on ne cherche plus simplement le mot MULTI.
+    On cherche les vrais codes PMU.
+    """
     paris = (
         course_obj.get("paris")
         or course_obj.get("typesParis")
@@ -303,72 +273,295 @@ def multi_bet_codes(course_obj: dict) -> list[str]:
         or []
     )
 
-    # Premier garde-fou : le pari doit réellement être proposé sur la course.
-    raw_text = json.dumps(paris, ensure_ascii=False, default=str).upper()
-    if "MULTI" not in raw_text:
-        return []
+    found: set[str] = set()
 
-    codes = []
-    for text in _collect_strings(paris):
-        upper = text.upper()
-        if "MULTI" in upper:
-            codes.append(upper)
+    for obj in _iter_dicts(paris):
+        for key in ("codePari", "typePari", "code"):
+            value = obj.get(key)
+            if value is None:
+                continue
 
-    if not codes:
-        codes = ["MULTI"]
+            code = str(value).strip().upper()
 
-    return sorted(set(codes))
+            if code in {"E_MULTI", "E_MINI_MULTI"}:
+                found.add(code)
+
+    return sorted(found)
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def discover_multi_supports(start_iso: str, end_iso: str) -> pd.DataFrame:
-    start = date.fromisoformat(start_iso)
-    end = date.fromisoformat(end_iso)
-
+def programme_multi_candidates(
+    start: date,
+    end: date,
+) -> pd.DataFrame:
     rows: list[dict] = []
 
     for day in _daterange(start, end):
         programme = get_programme(day.isoformat())
 
-        for item in course_objects(programme):
-            codes = multi_bet_codes(item["raw"])
-            if not codes:
+        root = programme.get("programme")
+        if not isinstance(root, dict):
+            root = programme
+
+        for reunion_obj in _find_reunions(root):
+            reunion = _meeting_number(reunion_obj)
+            if reunion is None:
                 continue
 
-            rows.append(
-                {
-                    "race_date": day.isoformat(),
-                    "meeting_number": item["reunion"],
-                    "race_number": item["course"],
-                    "hippodrome_pmu": item["hippodrome_pmu"],
-                    "label_pmu": item["label_pmu"],
-                    "field_size_pmu": item["field_size_pmu"],
-                    "multi_codes": " | ".join(codes),
-                }
-            )
+            courses = reunion_obj.get("courses")
+            if not isinstance(courses, list):
+                continue
+
+            for course_obj in courses:
+                if not isinstance(course_obj, dict):
+                    continue
+
+                course = _course_number(course_obj)
+                if course is None:
+                    continue
+
+                codes = exact_multi_codes(course_obj)
+
+                if not codes:
+                    continue
+
+                rows.append(
+                    {
+                        "race_date": day.isoformat(),
+                        "meeting_number": reunion,
+                        "race_number": course,
+                        "hippodrome_pmu": _hippodrome(reunion_obj),
+                        "label_pmu": _label(course_obj, course),
+                        "multi_codes": " | ".join(codes),
+                    }
+                )
 
     if not rows:
         return pd.DataFrame()
 
-    result = pd.DataFrame(rows).drop_duplicates(
-        ["race_date", "meeting_number", "race_number"]
+    return (
+        pd.DataFrame(rows)
+        .drop_duplicates(
+            ["race_date", "meeting_number", "race_number"]
+        )
+        .sort_values(
+            ["race_date", "meeting_number", "race_number"]
+        )
+        .reset_index(drop=True)
     )
 
-    return result.sort_values(
-        ["race_date", "meeting_number", "race_number"]
-    ).reset_index(drop=True)
+
+# =============================================================================
+# PMU — RAPPORTS MULTI
+# =============================================================================
+
+def iter_bet_blocks(obj: Any):
+    if isinstance(obj, dict):
+        if "typePari" in obj and "rapports" in obj:
+            yield obj
+
+        for value in obj.values():
+            yield from iter_bet_blocks(value)
+
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from iter_bet_blocks(value)
+
+
+def combination_numbers(value: Any) -> list[int]:
+    result: list[int] = []
+
+    if value is None:
+        return result
+
+    if isinstance(value, (int, np.integer)):
+        return [int(value)]
+
+    if isinstance(value, float):
+        if value.is_integer():
+            return [int(value)]
+        return result
+
+    if isinstance(value, str):
+        import re
+
+        return [
+            int(x)
+            for x in re.findall(r"\d+", value)
+        ]
+
+    if isinstance(value, list):
+        for item in value:
+            result.extend(combination_numbers(item))
+        return result
+
+    if isinstance(value, dict):
+        preferred = [
+            "numPmu",
+            "numero",
+            "numParticipant",
+            "cheval",
+        ]
+
+        for key in preferred:
+            if key in value:
+                numbers = combination_numbers(value[key])
+                if numbers:
+                    return numbers
+
+        for item in value.values():
+            result.extend(combination_numbers(item))
+
+    return result
+
+
+def extract_multi_target(payload: Any) -> tuple[frozenset[int] | None, str]:
+    """
+    Extrait les 4 chevaux de la combinaison gagnante à partir
+    des rapports définitifs du vrai pari Multi.
+    """
+    candidates: list[tuple[int, int, int, int]] = []
+    matched_types: list[str] = []
+
+    for block in iter_bet_blocks(payload):
+        bet_type = str(
+            block.get("typePari") or ""
+        ).strip().upper()
+
+        if bet_type not in {"E_MULTI", "E_MINI_MULTI"}:
+            # Certaines versions ajoutent un libellé autour du code.
+            if not (
+                "MULTI" in bet_type
+                and "COUPLE" not in bet_type
+                and "TRIO" not in bet_type
+                and "QUINTE" not in bet_type
+            ):
+                continue
+
+        matched_types.append(bet_type)
+
+        reports = block.get("rapports") or []
+
+        if not isinstance(reports, list):
+            continue
+
+        for report in reports:
+            if not isinstance(report, dict):
+                continue
+
+            numbers = combination_numbers(
+                report.get("combinaison")
+            )
+
+            unique = list(dict.fromkeys(numbers))
+
+            # Un rapport Multi gagnant doit nous permettre
+            # d'identifier les 4 chevaux de l'arrivée utile.
+            if len(unique) == 4:
+                candidates.append(
+                    tuple(sorted(int(x) for x in unique))
+                )
+
+    if not candidates:
+        return None, "aucune combinaison Multi Top4 exploitable"
+
+    # En cas de répétition du même résultat dans plusieurs sous-rapports,
+    # on prend la combinaison la plus fréquente.
+    counts: dict[tuple[int, int, int, int], int] = {}
+
+    for combo in candidates:
+        counts[combo] = counts.get(combo, 0) + 1
+
+    ordered = sorted(
+        counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+
+    best_combo, best_count = ordered[0]
+
+    # Si plusieurs combinaisons différentes ont exactement la même fréquence,
+    # on refuse de fabriquer une cible.
+    tied = [
+        combo
+        for combo, count in ordered
+        if count == best_count
+    ]
+
+    if len(tied) > 1:
+        return None, "rapports Multi ambigus"
+
+    return frozenset(best_combo), ""
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def build_exact_pmu_cohort(
+    start_iso: str,
+    end_iso: str,
+) -> pd.DataFrame:
+    start = date.fromisoformat(start_iso)
+    end = date.fromisoformat(end_iso)
+
+    candidates = programme_multi_candidates(
+        start,
+        end,
+    )
+
+    rows: list[dict] = []
+
+    if candidates.empty:
+        return pd.DataFrame()
+
+    for _, row in candidates.iterrows():
+        day_iso = str(row["race_date"])
+        reunion = int(row["meeting_number"])
+        course = int(row["race_number"])
+
+        target = None
+        reason = ""
+        report_ok = False
+
+        try:
+            payload = get_final_reports(
+                day_iso,
+                reunion,
+                course,
+            )
+
+            target, reason = extract_multi_target(
+                payload
+            )
+
+            report_ok = target is not None
+
+        except Exception as exc:
+            reason = f"rapport indisponible: {type(exc).__name__}"
+
+        rows.append(
+            {
+                **row.to_dict(),
+                "report_ok": report_ok,
+                "target_top4": (
+                    "-".join(map(str, sorted(target)))
+                    if target is not None
+                    else ""
+                ),
+                "target_set": target,
+                "report_reason": reason,
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 # =============================================================================
-# SUPABASE : LECTURE PAGINÉE
+# SUPABASE
 # =============================================================================
 
-def load_races(start_day: date, end_day: date) -> pd.DataFrame:
-    client = get_supabase_client()
+def load_races(start: date, end: date) -> pd.DataFrame:
+    client = get_client()
     output: list[dict] = []
 
     page_size = 1000
-    start = 0
+    offset = 0
 
     while True:
         response = (
@@ -377,9 +570,9 @@ def load_races(start_day: date, end_day: date) -> pd.DataFrame:
                 "id,external_id,race_date,meeting_number,race_number,"
                 "hippodrome,discipline,distance_m,terrain,field_size,status"
             )
-            .gte("race_date", start_day.isoformat())
-            .lte("race_date", end_day.isoformat())
-            .range(start, start + page_size - 1)
+            .gte("race_date", start.isoformat())
+            .lte("race_date", end.isoformat())
+            .range(offset, offset + page_size - 1)
             .execute()
         )
 
@@ -389,57 +582,36 @@ def load_races(start_day: date, end_day: date) -> pd.DataFrame:
         if len(batch) < page_size:
             break
 
-        start += page_size
+        offset += page_size
 
     if not output:
         return pd.DataFrame()
 
     df = pd.DataFrame(output)
-    df["id"] = pd.to_numeric(df["id"], errors="coerce")
+
+    df["id"] = pd.to_numeric(
+        df["id"],
+        errors="coerce",
+    )
+
     df = df[df["id"].notna()].copy()
     df["id"] = df["id"].astype(int)
 
     return df
 
 
-def _chunks(values: list[int], size: int = 30):
+def _chunks(values: list[int], size: int):
     for i in range(0, len(values), size):
         yield values[i : i + size]
-
-
-def load_participants(race_ids: list[int]) -> pd.DataFrame:
-    if not race_ids:
-        return pd.DataFrame()
-
-    client = get_supabase_client()
-    output: list[dict] = []
-
-    for chunk in _chunks(race_ids, 30):
-        response = (
-            client.table("participants")
-            .select(
-                "id,race_id,horse_name,horse_number,odds,"
-                "finish_position,is_non_runner"
-            )
-            .in_("race_id", chunk)
-            .execute()
-        )
-        output.extend(_rows(response))
-
-    if not output:
-        return pd.DataFrame()
-
-    return pd.DataFrame(output)
 
 
 def load_predictions(race_ids: list[int]) -> pd.DataFrame:
     if not race_ids:
         return pd.DataFrame()
 
-    client = get_supabase_client()
+    client = get_client()
     output: list[dict] = []
 
-    # 20 courses / requête pour rester largement sous les limites.
     for chunk in _chunks(race_ids, 20):
         response = (
             client.table("forward_model_predictions")
@@ -453,6 +625,7 @@ def load_predictions(race_ids: list[int]) -> pd.DataFrame:
             .in_("model_version_id", [MODEL8_ID, NEURAL_ID])
             .execute()
         )
+
         output.extend(_rows(response))
 
     if not output:
@@ -460,27 +633,31 @@ def load_predictions(race_ids: list[int]) -> pd.DataFrame:
 
     df = pd.DataFrame(output)
 
-    # On ne garde que les deux artefacts gelés attendus.
+    model_ids = pd.to_numeric(
+        df["model_version_id"],
+        errors="coerce",
+    )
+
     good8 = (
-        (pd.to_numeric(df["model_version_id"], errors="coerce") == MODEL8_ID)
+        (model_ids == MODEL8_ID)
         & (df["artifact_hash"].astype(str) == MODEL8_HASH)
     )
+
     good9 = (
-        (pd.to_numeric(df["model_version_id"], errors="coerce") == NEURAL_ID)
+        (model_ids == NEURAL_ID)
         & (df["artifact_hash"].astype(str) == NEURAL_HASH)
     )
 
     df = df[good8 | good9].copy()
 
-    # Si plusieurs snapshots existent, on garde le plus récent par cheval/modèle.
-    df["predicted_at_dt"] = pd.to_datetime(
+    df["_predicted_at"] = pd.to_datetime(
         df["predicted_at"],
         errors="coerce",
         utc=True,
     )
 
     df = (
-        df.sort_values(["predicted_at_dt", "id"])
+        df.sort_values(["_predicted_at", "id"])
         .drop_duplicates(
             ["race_id", "horse_number", "model_version_id"],
             keep="last",
@@ -491,87 +668,32 @@ def load_predictions(race_ids: list[int]) -> pd.DataFrame:
     return df
 
 
-# =============================================================================
-# CONSTRUCTION DU JEU DE CALIBRATION
-# =============================================================================
-
-def map_supports_to_races(
-    supports: pd.DataFrame,
+def map_pmu_to_db(
+    pmu: pd.DataFrame,
     races: pd.DataFrame,
 ) -> pd.DataFrame:
-    if supports.empty or races.empty:
+    if pmu.empty or races.empty:
         return pd.DataFrame()
 
-    left = supports.copy()
+    left = pmu.copy()
     right = races.copy()
 
     left["race_date"] = left["race_date"].astype(str)
     right["race_date"] = right["race_date"].astype(str)
 
-    mapped = left.merge(
+    merged = left.merge(
         right,
         on=["race_date", "meeting_number", "race_number"],
         how="left",
         suffixes=("_pmu", "_db"),
     )
 
-    mapped = mapped.rename(columns={"id": "race_id"})
-
-    mapped["race_id"] = pd.to_numeric(
-        mapped["race_id"],
-        errors="coerce",
+    return merged.rename(
+        columns={"id": "race_id"}
     )
 
-    return mapped
 
-
-def actual_top4_by_race(
-    participants: pd.DataFrame,
-) -> dict[int, frozenset[int]]:
-    targets: dict[int, frozenset[int]] = {}
-
-    if participants.empty:
-        return targets
-
-    data = participants.copy()
-    data["race_id"] = pd.to_numeric(data["race_id"], errors="coerce")
-    data["horse_number"] = pd.to_numeric(
-        data["horse_number"],
-        errors="coerce",
-    )
-    data["finish_position"] = pd.to_numeric(
-        data["finish_position"],
-        errors="coerce",
-    )
-
-    if "is_non_runner" in data.columns:
-        data = data[data["is_non_runner"].fillna(False) != True].copy()
-
-    data = data[
-        data["race_id"].notna()
-        & data["horse_number"].notna()
-        & data["finish_position"].notna()
-        & data["finish_position"].gt(0)
-    ].copy()
-
-    for race_id, group in data.groupby("race_id"):
-        group = group.sort_values(
-            ["finish_position", "horse_number"],
-            ascending=[True, True],
-        )
-
-        top4 = group.head(4)
-        if len(top4) != 4:
-            continue
-
-        targets[int(race_id)] = frozenset(
-            int(x) for x in top4["horse_number"].tolist()
-        )
-
-    return targets
-
-
-def paired_prediction_frames(
+def paired_frames(
     predictions: pd.DataFrame,
 ) -> dict[int, pd.DataFrame]:
     result: dict[int, pd.DataFrame] = {}
@@ -579,21 +701,13 @@ def paired_prediction_frames(
     if predictions.empty:
         return result
 
-    p8 = predictions[
-        pd.to_numeric(
-            predictions["model_version_id"],
-            errors="coerce",
-        )
-        == MODEL8_ID
-    ].copy()
+    model_id = pd.to_numeric(
+        predictions["model_version_id"],
+        errors="coerce",
+    )
 
-    p9 = predictions[
-        pd.to_numeric(
-            predictions["model_version_id"],
-            errors="coerce",
-        )
-        == NEURAL_ID
-    ].copy()
+    p8 = predictions[model_id == MODEL8_ID].copy()
+    p9 = predictions[model_id == NEURAL_ID].copy()
 
     if p8.empty or p9.empty:
         return result
@@ -602,12 +716,10 @@ def paired_prediction_frames(
         columns={
             "horse_name": "horse_name_m8",
             "odds_snapshot": "odds",
-            "market_probability": "market_probability",
             "win_probability": "m8_win_probability",
             "place_probability": "m8_place_probability",
             "rank_win": "m8_rank_win",
             "rank_place": "m8_rank_place",
-            "scheduled_start": "scheduled_start_m8",
         }
     )
 
@@ -616,7 +728,6 @@ def paired_prediction_frames(
             "horse_name": "horse_name_neural",
             "place_probability": "neural_top3_probability",
             "rank_place": "neural_rank",
-            "scheduled_start": "scheduled_start_neural",
         }
     )
 
@@ -631,7 +742,6 @@ def paired_prediction_frames(
         "m8_place_probability",
         "m8_rank_win",
         "m8_rank_place",
-        "scheduled_start_m8",
     ]
 
     keep9 = [
@@ -640,7 +750,6 @@ def paired_prediction_frames(
         "horse_name_neural",
         "neural_top3_probability",
         "neural_rank",
-        "scheduled_start_neural",
     ]
 
     merged = p8[keep8].merge(
@@ -653,6 +762,7 @@ def paired_prediction_frames(
         merged["race_id"],
         errors="coerce",
     )
+
     merged["horse_number"] = pd.to_numeric(
         merged["horse_number"],
         errors="coerce",
@@ -673,40 +783,72 @@ def paired_prediction_frames(
 
 
 # =============================================================================
-# FEATURES M9
+# FEATURES
 # =============================================================================
 
-def _minmax_high_is_good(series: pd.Series) -> pd.Series:
-    values = pd.to_numeric(series, errors="coerce")
+def _minmax(series: pd.Series) -> pd.Series:
+    values = pd.to_numeric(
+        series,
+        errors="coerce",
+    )
 
     if values.notna().sum() == 0:
-        return pd.Series(0.5, index=series.index, dtype=float)
+        return pd.Series(
+            0.5,
+            index=series.index,
+            dtype=float,
+        )
 
     low = values.min()
     high = values.max()
 
-    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
-        return pd.Series(0.5, index=series.index, dtype=float)
+    if (
+        not np.isfinite(low)
+        or not np.isfinite(high)
+        or high <= low
+    ):
+        return pd.Series(
+            0.5,
+            index=series.index,
+            dtype=float,
+        )
 
-    out = (values - low) / (high - low)
-    return out.fillna(0.5).clip(0.0, 1.0)
+    return (
+        (values - low) / (high - low)
+    ).fillna(0.5).clip(0.0, 1.0)
 
 
-def _rank_score(rank_series: pd.Series, n: int) -> pd.Series:
-    ranks = pd.to_numeric(rank_series, errors="coerce")
+def _rank_score(
+    ranks: pd.Series,
+    n: int,
+) -> pd.Series:
+    values = pd.to_numeric(
+        ranks,
+        errors="coerce",
+    )
 
     if n <= 1:
-        return pd.Series(1.0, index=rank_series.index, dtype=float)
+        return pd.Series(
+            1.0,
+            index=ranks.index,
+            dtype=float,
+        )
 
-    score = 1.0 - ((ranks - 1.0) / float(n - 1))
+    score = (
+        1.0
+        - (values - 1.0) / float(n - 1)
+    )
+
     return score.fillna(0.5).clip(0.0, 1.0)
 
 
-def engineer_race_features(frame: pd.DataFrame) -> pd.DataFrame:
-    df = frame.copy().reset_index(drop=True)
+def engineer_features(
+    raw: pd.DataFrame,
+) -> pd.DataFrame:
+    df = raw.copy().reset_index(drop=True)
     n = len(df)
 
-    numeric_columns = [
+    numeric = [
         "odds",
         "market_probability",
         "m8_win_probability",
@@ -717,61 +859,75 @@ def engineer_race_features(frame: pd.DataFrame) -> pd.DataFrame:
         "neural_rank",
     ]
 
-    for column in numeric_columns:
+    for column in numeric:
         if column not in df.columns:
             df[column] = np.nan
-        df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    # Fallback marché depuis la cote.
-    fallback_market = 1.0 / df["odds"].where(df["odds"] > 1.0)
-    df["market_probability"] = df["market_probability"].fillna(fallback_market)
-
-    # Fallback rangs depuis les probabilités si nécessaire.
-    if df["m8_rank_win"].isna().any():
-        inferred = df["m8_win_probability"].rank(
-            method="first",
-            ascending=False,
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
         )
-        df["m8_rank_win"] = df["m8_rank_win"].fillna(inferred)
 
-    if df["m8_rank_place"].isna().any():
-        inferred = df["m8_place_probability"].rank(
-            method="first",
-            ascending=False,
-        )
-        df["m8_rank_place"] = df["m8_rank_place"].fillna(inferred)
-
-    if df["neural_rank"].isna().any():
-        inferred = df["neural_top3_probability"].rank(
-            method="first",
-            ascending=False,
-        )
-        df["neural_rank"] = df["neural_rank"].fillna(inferred)
-
-    df["market_rank"] = df["market_probability"].rank(
-        method="first",
-        ascending=False,
+    fallback_market = (
+        1.0
+        / df["odds"].where(df["odds"] > 1.0)
     )
 
-    # Chaque signal mélange position relative + intensité de probabilité.
+    df["market_probability"] = (
+        df["market_probability"]
+        .fillna(fallback_market)
+    )
+
+    if df["m8_rank_win"].isna().any():
+        fallback = (
+            df["m8_win_probability"]
+            .rank(method="first", ascending=False)
+        )
+        df["m8_rank_win"] = (
+            df["m8_rank_win"].fillna(fallback)
+        )
+
+    if df["m8_rank_place"].isna().any():
+        fallback = (
+            df["m8_place_probability"]
+            .rank(method="first", ascending=False)
+        )
+        df["m8_rank_place"] = (
+            df["m8_rank_place"].fillna(fallback)
+        )
+
+    if df["neural_rank"].isna().any():
+        fallback = (
+            df["neural_top3_probability"]
+            .rank(method="first", ascending=False)
+        )
+        df["neural_rank"] = (
+            df["neural_rank"].fillna(fallback)
+        )
+
+    df["market_rank"] = (
+        df["market_probability"]
+        .rank(method="first", ascending=False)
+    )
+
     df["sig_m8_win"] = (
         0.70 * _rank_score(df["m8_rank_win"], n)
-        + 0.30 * _minmax_high_is_good(df["m8_win_probability"])
+        + 0.30 * _minmax(df["m8_win_probability"])
     )
 
     df["sig_m8_place"] = (
         0.70 * _rank_score(df["m8_rank_place"], n)
-        + 0.30 * _minmax_high_is_good(df["m8_place_probability"])
+        + 0.30 * _minmax(df["m8_place_probability"])
     )
 
     df["sig_neural_top3"] = (
         0.70 * _rank_score(df["neural_rank"], n)
-        + 0.30 * _minmax_high_is_good(df["neural_top3_probability"])
+        + 0.30 * _minmax(df["neural_top3_probability"])
     )
 
     df["sig_market"] = (
         0.70 * _rank_score(df["market_rank"], n)
-        + 0.30 * _minmax_high_is_good(df["market_probability"])
+        + 0.30 * _minmax(df["market_probability"])
     )
 
     top4_votes = (
@@ -788,9 +944,8 @@ def engineer_race_features(frame: pd.DataFrame) -> pd.DataFrame:
         + (df["market_rank"] <= 7).astype(float)
     ) / 4.0
 
-    # Le max M8/Neural préserve un "divergent fort" soutenu par l'un des deux.
     union_strength = np.maximum(
-        df["sig_m8_win"].to_numpy(float),
+        df["sig_m8_place"].to_numpy(float),
         df["sig_neural_top3"].to_numpy(float),
     )
 
@@ -803,7 +958,9 @@ def engineer_race_features(frame: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def feature_matrix(df: pd.DataFrame) -> np.ndarray:
+def feature_matrix(
+    df: pd.DataFrame,
+) -> np.ndarray:
     return df[
         [
             "sig_m8_win",
@@ -816,107 +973,62 @@ def feature_matrix(df: pd.DataFrame) -> np.ndarray:
 
 
 # =============================================================================
-# ÉVALUATION MULTI
+# BACKTEST
 # =============================================================================
 
 def _ordered_indices(
     frame: pd.DataFrame,
     scores: np.ndarray,
 ) -> np.ndarray:
-    horse_numbers = pd.to_numeric(
+    horse = pd.to_numeric(
         frame["horse_number"],
         errors="coerce",
     ).fillna(999).to_numpy(float)
 
-    m8_ranks = pd.to_numeric(
-        frame["m8_rank_win"],
+    m8_place = pd.to_numeric(
+        frame["m8_rank_place"],
         errors="coerce",
     ).fillna(999).to_numpy(float)
 
-    # np.lexsort : dernière clé = clé primaire.
     return np.lexsort(
         (
-            horse_numbers,
-            m8_ranks,
+            horse,
+            m8_place,
             -scores,
         )
     )
 
 
-def _hit(target: frozenset[int], selected: list[int]) -> bool:
-    return target.issubset(set(selected))
+def _is_hit(
+    target: frozenset[int],
+    selection: list[int],
+) -> bool:
+    return target.issubset(set(selection))
 
 
-def evaluate_weights(
-    race_cache: list[dict],
-    weights: np.ndarray,
+def evaluate_rank_column(
+    cache: list[dict],
+    column: str,
 ) -> dict:
-    hits = {4: 0, 5: 0, 6: 0, 7: 0}
-    eligible = {4: 0, 5: 0, 6: 0, 7: 0}
-    overlap4 = 0
-    overlap5 = 0
-    overlap7 = 0
-
-    for item in race_cache:
-        frame = item["frame"]
-        matrix = item["matrix"]
-        target = item["target"]
-
-        scores = matrix @ weights
-        order = _ordered_indices(frame, scores)
-
-        ranked_numbers = [
-            int(x)
-            for x in frame.iloc[order]["horse_number"].tolist()
-        ]
-
-        for size in (4, 5, 6, 7):
-            if len(ranked_numbers) < size:
-                continue
-
-            eligible[size] += 1
-            selection = ranked_numbers[:size]
-
-            if _hit(target, selection):
-                hits[size] += 1
-
-        top4 = ranked_numbers[: min(4, len(ranked_numbers))]
-        top5 = ranked_numbers[: min(5, len(ranked_numbers))]
-        top7 = ranked_numbers[: min(7, len(ranked_numbers))]
-
-        overlap4 += len(target.intersection(top4))
-        overlap5 += len(target.intersection(top5))
-        overlap7 += len(target.intersection(top7))
-
-    return {
-        "hits4": hits[4],
-        "hits5": hits[5],
-        "hits6": hits[6],
-        "hits7": hits[7],
-        "eligible4": eligible[4],
-        "eligible5": eligible[5],
-        "eligible6": eligible[6],
-        "eligible7": eligible[7],
-        "overlap4": overlap4,
-        "overlap5": overlap5,
-        "overlap7": overlap7,
+    hits = {
+        4: 0,
+        5: 0,
+        6: 0,
+        7: 0,
     }
 
+    eligible = {
+        4: 0,
+        5: 0,
+        6: 0,
+        7: 0,
+    }
 
-def evaluate_baseline(
-    race_cache: list[dict],
-    rank_column: str,
-) -> dict:
-    hits = {4: 0, 5: 0, 6: 0, 7: 0}
-    eligible = {4: 0, 5: 0, 6: 0, 7: 0}
-    overlap4 = 0
-
-    for item in race_cache:
+    for item in cache:
         frame = item["frame"].copy()
-        target = item["target"]
 
         frame["_rank"] = pd.to_numeric(
-            frame[rank_column],
+            frame[column],
             errors="coerce",
         )
 
@@ -926,7 +1038,8 @@ def evaluate_baseline(
         )
 
         ranked = [
-            int(x) for x in frame["horse_number"].tolist()
+            int(x)
+            for x in frame["horse_number"].tolist()
         ]
 
         for size in (4, 5, 6, 7):
@@ -934,37 +1047,111 @@ def evaluate_baseline(
                 continue
 
             eligible[size] += 1
-            if _hit(target, ranked[:size]):
+
+            if _is_hit(
+                item["target"],
+                ranked[:size],
+            ):
                 hits[size] += 1
 
-        overlap4 += len(target.intersection(ranked[:4]))
-
     return {
-        "hits4": hits[4],
-        "hits5": hits[5],
-        "hits6": hits[6],
-        "hits7": hits[7],
-        "eligible4": eligible[4],
-        "eligible5": eligible[5],
-        "eligible6": eligible[6],
-        "eligible7": eligible[7],
-        "overlap4": overlap4,
+        **{
+            f"hits{size}": hits[size]
+            for size in (4, 5, 6, 7)
+        },
+        **{
+            f"eligible{size}": eligible[size]
+            for size in (4, 5, 6, 7)
+        },
     }
 
 
-def _compositions(total: int, parts: int):
+def evaluate_weights(
+    cache: list[dict],
+    weights: np.ndarray,
+) -> dict:
+    hits = {
+        4: 0,
+        5: 0,
+        6: 0,
+        7: 0,
+    }
+
+    eligible = {
+        4: 0,
+        5: 0,
+        6: 0,
+        7: 0,
+    }
+
+    overlaps = {
+        4: 0,
+        5: 0,
+        7: 0,
+    }
+
+    for item in cache:
+        frame = item["frame"]
+        scores = item["matrix"] @ weights
+        order = _ordered_indices(frame, scores)
+
+        ranked = [
+            int(x)
+            for x in frame.iloc[order]["horse_number"].tolist()
+        ]
+
+        for size in (4, 5, 6, 7):
+            if len(ranked) < size:
+                continue
+
+            eligible[size] += 1
+
+            if _is_hit(
+                item["target"],
+                ranked[:size],
+            ):
+                hits[size] += 1
+
+        for size in (4, 5, 7):
+            overlaps[size] += len(
+                item["target"].intersection(
+                    ranked[:size]
+                )
+            )
+
+    return {
+        **{
+            f"hits{size}": hits[size]
+            for size in (4, 5, 6, 7)
+        },
+        **{
+            f"eligible{size}": eligible[size]
+            for size in (4, 5, 6, 7)
+        },
+        "overlap4": overlaps[4],
+        "overlap5": overlaps[5],
+        "overlap7": overlaps[7],
+    }
+
+
+def _compositions(
+    total: int,
+    parts: int,
+):
     if parts == 1:
         yield (total,)
         return
 
     for first in range(total + 1):
-        for rest in _compositions(total - first, parts - 1):
+        for rest in _compositions(
+            total - first,
+            parts - 1,
+        ):
             yield (first,) + rest
 
 
-def optimize_weights(
-    race_cache: list[dict],
-    progress=None,
+def optimize(
+    cache: list[dict],
 ) -> tuple[np.ndarray, dict, pd.DataFrame]:
     candidates = list(
         _compositions(
@@ -973,27 +1160,32 @@ def optimize_weights(
         )
     )
 
-    best_weights: np.ndarray | None = None
-    best_metrics: dict | None = None
+    progress = st.progress(
+        0.0,
+        text="Optimisation M9 V2…",
+    )
+
+    best_weights = None
+    best_metrics = None
     best_key = None
-    leaderboard: list[dict] = []
+    board: list[dict] = []
 
     total = len(candidates)
 
-    for index, units in enumerate(candidates, start=1):
-        weights = np.array(
-            units,
-            dtype=float,
-        ) / float(GRID_UNITS)
+    for i, units in enumerate(
+        candidates,
+        start=1,
+    ):
+        weights = (
+            np.array(units, dtype=float)
+            / float(GRID_UNITS)
+        )
 
         metrics = evaluate_weights(
-            race_cache,
+            cache,
             weights,
         )
 
-        # Objectif principal : MULTI 4 exact.
-        # Puis couverture 5/6/7 et overlaps.
-        # A égalité parfaite, on préfère des poids moins extrêmes.
         key = (
             metrics["hits4"],
             metrics["hits5"],
@@ -1010,290 +1202,364 @@ def optimize_weights(
             best_weights = weights.copy()
             best_metrics = dict(metrics)
 
-        leaderboard.append(
+        board.append(
             {
                 **{
-                    name: float(weight)
-                    for name, weight in zip(SIGNAL_NAMES, weights)
+                    signal: float(weight)
+                    for signal, weight
+                    in zip(SIGNAL_NAMES, weights)
                 },
                 **metrics,
                 "max_weight": float(weights.max()),
             }
         )
 
-        if progress is not None and (
-            index == 1
-            or index == total
-            or index % 150 == 0
+        if (
+            i == 1
+            or i == total
+            or i % 150 == 0
         ):
             progress.progress(
-                index / total,
+                i / total,
                 text=(
-                    f"Optimisation M9 : {index:,}/{total:,} "
-                    "combinaisons de poids"
+                    f"Optimisation M9 V2 : "
+                    f"{i:,}/{total:,}"
                 ),
             )
+
+    progress.empty()
 
     if best_weights is None or best_metrics is None:
         raise RuntimeError("Optimisation impossible.")
 
-    board = pd.DataFrame(leaderboard)
+    leaderboard = (
+        pd.DataFrame(board)
+        .sort_values(
+            [
+                "hits4",
+                "hits5",
+                "hits6",
+                "hits7",
+                "overlap4",
+                "overlap5",
+                "overlap7",
+                "max_weight",
+            ],
+            ascending=[
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                True,
+            ],
+        )
+        .head(30)
+        .reset_index(drop=True)
+    )
 
-    board = board.sort_values(
-        [
-            "hits4",
-            "hits5",
-            "hits6",
-            "hits7",
-            "overlap4",
-            "overlap5",
-            "overlap7",
-            "max_weight",
-        ],
-        ascending=[
-            False,
-            False,
-            False,
-            False,
-            False,
-            False,
-            False,
-            True,
-        ],
-    ).head(30)
-
-    return best_weights, best_metrics, board.reset_index(drop=True)
+    return (
+        best_weights,
+        best_metrics,
+        leaderboard,
+    )
 
 
 # =============================================================================
-# CHARGEMENT / CALIBRATION
+# CALIBRATION COHORT
 # =============================================================================
 
-def build_calibration_data() -> dict:
-    supports = discover_multi_supports(
+def build_calibration_package() -> dict:
+    pmu_all = build_exact_pmu_cohort(
         CALIBRATION_START.isoformat(),
         CALIBRATION_END.isoformat(),
     )
+
+    if pmu_all.empty:
+        raise RuntimeError(
+            "Aucun support Multi PMU détecté."
+        )
+
+    # La cohorte historique est définie par un VRAI rapport Multi
+    # dont la combinaison Top4 est exploitable.
+    pmu_cohort = pmu_all[
+        pmu_all["report_ok"] == True
+    ].copy()
 
     races = load_races(
         CALIBRATION_START,
         CALIBRATION_END,
     )
 
-    mapped = map_supports_to_races(
-        supports,
+    mapped = map_pmu_to_db(
+        pmu_cohort,
         races,
     )
+
+    if mapped.empty or "race_id" not in mapped.columns:
+        return {
+            "pmu_all": pmu_all,
+            "pmu_cohort": pmu_cohort,
+            "mapped": mapped,
+            "cache": [],
+            "audit": pd.DataFrame(),
+        }
 
     mapped_ok = mapped[
         mapped["race_id"].notna()
     ].copy()
 
-    mapped_ok["race_id"] = mapped_ok["race_id"].astype(int)
+    mapped_ok["race_id"] = pd.to_numeric(
+        mapped_ok["race_id"],
+        errors="coerce",
+    )
+
+    mapped_ok = mapped_ok[
+        mapped_ok["race_id"].notna()
+    ].copy()
+
+    mapped_ok["race_id"] = (
+        mapped_ok["race_id"].astype(int)
+    )
 
     race_ids = sorted(
         mapped_ok["race_id"].unique().tolist()
-    )
-
-    participants = load_participants(
-        race_ids
     )
 
     predictions = load_predictions(
         race_ids
     )
 
-    targets = actual_top4_by_race(
-        participants
-    )
-
-    frames = paired_prediction_frames(
+    frames = paired_frames(
         predictions
     )
 
-    race_cache: list[dict] = []
+    cache: list[dict] = []
     audit_rows: list[dict] = []
 
-    for _, support in mapped_ok.iterrows():
-        race_id = int(support["race_id"])
-
-        target = targets.get(race_id)
-        raw_frame = frames.get(race_id)
-
-        reason = None
-
-        if target is None or len(target) != 4:
-            reason = "arrivée Top4 indisponible"
-
-        elif raw_frame is None or raw_frame.empty:
-            reason = "prédictions M8/Neural absentes"
-
-        elif len(raw_frame) < 4:
-            reason = "moins de 4 prédictions appariées"
-
-        if reason is not None:
-            audit_rows.append(
-                {
-                    "race_date": support["race_date"],
-                    "meeting_number": support["meeting_number"],
-                    "race_number": support["race_number"],
-                    "race_id": race_id,
-                    "usable": False,
-                    "reason": reason,
-                }
-            )
-            continue
-
-        frame = engineer_race_features(
-            raw_frame
+    for _, row in mapped.iterrows():
+        race_id = _safe_int(
+            row.get("race_id")
         )
 
-        race_cache.append(
+        target = row.get("target_set")
+        raw = (
+            frames.get(race_id)
+            if race_id is not None
+            else None
+        )
+
+        reason = ""
+
+        if race_id is None:
+            reason = "course absente Supabase"
+
+        elif not isinstance(target, frozenset) or len(target) != 4:
+            reason = "cible PMU Top4 invalide"
+
+        elif raw is None or raw.empty:
+            reason = "prédictions M8/Neural absentes"
+
+        elif len(raw) < 4:
+            reason = "moins de 4 chevaux appariés"
+
+        else:
+            predicted_numbers = set(
+                int(x)
+                for x in raw["horse_number"].tolist()
+            )
+
+            if not target.issubset(predicted_numbers):
+                reason = "un cheval du Top4 PMU absent des prédictions"
+
+        usable = reason == ""
+
+        audit_rows.append(
+            {
+                "race_date": row.get("race_date"),
+                "meeting_number": row.get("meeting_number"),
+                "race_number": row.get("race_number"),
+                "race_id": race_id,
+                "multi_codes": row.get("multi_codes"),
+                "target_top4": row.get("target_top4"),
+                "usable": usable,
+                "reason": reason,
+                "paired_horses": (
+                    len(raw)
+                    if raw is not None
+                    else 0
+                ),
+            }
+        )
+
+        if not usable:
+            continue
+
+        frame = engineer_features(
+            raw
+        )
+
+        cache.append(
             {
                 "race_id": race_id,
-                "race_date": str(support["race_date"]),
-                "meeting_number": int(support["meeting_number"]),
-                "race_number": int(support["race_number"]),
-                "hippodrome": support.get("hippodrome", support.get("hippodrome_pmu")),
-                "label_pmu": support.get("label_pmu"),
+                "race_date": str(row.get("race_date")),
+                "meeting_number": int(row.get("meeting_number")),
+                "race_number": int(row.get("race_number")),
+                "hippodrome": (
+                    row.get("hippodrome")
+                    or row.get("hippodrome_pmu")
+                    or "INCONNU"
+                ),
+                "label_pmu": row.get("label_pmu"),
                 "target": target,
                 "frame": frame,
                 "matrix": feature_matrix(frame),
             }
         )
 
-        audit_rows.append(
-            {
-                "race_date": support["race_date"],
-                "meeting_number": support["meeting_number"],
-                "race_number": support["race_number"],
-                "race_id": race_id,
-                "usable": True,
-                "reason": "",
-                "target_top4": "-".join(map(str, sorted(target))),
-                "paired_horses": len(frame),
-            }
-        )
-
     return {
-        "supports": supports,
+        "pmu_all": pmu_all,
+        "pmu_cohort": pmu_cohort,
         "mapped": mapped,
-        "race_cache": race_cache,
+        "cache": cache,
         "audit": pd.DataFrame(audit_rows),
     }
 
 
-def calibration_fingerprint(
-    weights: np.ndarray,
-) -> str:
-    payload = {
-        "app_version": APP_VERSION,
-        "period": [
-            CALIBRATION_START.isoformat(),
-            CALIBRATION_END.isoformat(),
-        ],
-        "model8_hash": MODEL8_HASH,
-        "neural_hash": NEURAL_HASH,
-        "grid_step": GRID_STEP,
-        "signals": SIGNAL_NAMES,
-        "weights": [
-            round(float(x), 6)
-            for x in weights
-        ],
-    }
-
-    raw = json.dumps(
-        payload,
-        sort_keys=True,
-    ).encode("utf-8")
-
-    return hashlib.sha256(raw).hexdigest()
+def _matches_expected(
+    metrics: dict,
+) -> bool:
+    return all(
+        metrics.get(f"hits{size}")
+        == EXPECTED_M8[size]
+        for size in (4, 5, 6)
+    )
 
 
 def run_calibration() -> dict:
     with st.spinner(
-        "Chargement des 84 courses Multi, résultats et prédictions M8/Neural…"
+        "Reconstruction de la cohorte exacte via les rapports définitifs PMU…"
     ):
-        package = build_calibration_data()
+        package = build_calibration_package()
 
-    supports = package["supports"]
-    mapped = package["mapped"]
-    race_cache = package["race_cache"]
+    cache = package["cache"]
 
-    baseline_m8 = evaluate_baseline(
-        race_cache,
+    if not cache:
+        raise RuntimeError(
+            "Aucune course exploitable."
+        )
+
+    m8_win = evaluate_rank_column(
+        cache,
         "m8_rank_win",
     )
 
-    baseline_m8_place = evaluate_baseline(
-        race_cache,
+    m8_place = evaluate_rank_column(
+        cache,
         "m8_rank_place",
     )
 
-    baseline_neural = evaluate_baseline(
-        race_cache,
+    neural = evaluate_rank_column(
+        cache,
         "neural_rank",
     )
 
-    progress = st.progress(
-        0.0,
-        text="Préparation de l'optimiseur M9…",
+    # Référence historique : on ne devine pas le tri.
+    # On choisit uniquement celui qui reproduit EXACTEMENT 5/15/23.
+    if _matches_expected(m8_win):
+        reference_column = "m8_rank_win"
+        reference_name = "M8 win"
+        reference_metrics = m8_win
+
+    elif _matches_expected(m8_place):
+        reference_column = "m8_rank_place"
+        reference_name = "M8 place"
+        reference_metrics = m8_place
+
+    else:
+        reference_column = None
+        reference_name = "NON REPRODUITE"
+        reference_metrics = None
+
+    weights, optimized, leaderboard = optimize(
+        cache
     )
 
-    best_weights, best_metrics, leaderboard = optimize_weights(
-        race_cache,
-        progress=progress,
+    lock_ok = (
+        len(package["pmu_cohort"]) == EXPECTED_COHORT
+        and len(cache) == EXPECTED_COHORT
+        and reference_column is not None
     )
 
-    progress.empty()
+    fingerprint_payload = {
+        "version": APP_VERSION,
+        "cohort": len(cache),
+        "reference": reference_name,
+        "weights": [
+            round(float(x), 6)
+            for x in weights
+        ],
+        "model8_hash": MODEL8_HASH,
+        "neural_hash": NEURAL_HASH,
+    }
 
-    fingerprint = calibration_fingerprint(
-        best_weights
-    )
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
     return {
         **package,
-        "baseline_m8": baseline_m8,
-        "baseline_m8_place": baseline_m8_place,
-        "baseline_neural": baseline_neural,
-        "weights": best_weights,
-        "metrics": best_metrics,
+        "m8_win": m8_win,
+        "m8_place": m8_place,
+        "neural": neural,
+        "reference_column": reference_column,
+        "reference_name": reference_name,
+        "reference_metrics": reference_metrics,
+        "weights": weights,
+        "optimized": optimized,
         "leaderboard": leaderboard,
+        "lock_ok": lock_ok,
         "fingerprint": fingerprint,
-        "support_count": len(supports),
-        "mapped_count": int(mapped["race_id"].notna().sum()) if not mapped.empty else 0,
-        "usable_count": len(race_cache),
     }
 
 
 # =============================================================================
-# APPLICATION DES POIDS À UNE COURSE FUTURE
+# FUTURE
 # =============================================================================
 
-def rank_with_m9(
-    raw_frame: pd.DataFrame,
+def rank_m9(
+    raw: pd.DataFrame,
     weights: np.ndarray,
 ) -> pd.DataFrame:
-    frame = engineer_race_features(
-        raw_frame
+    frame = engineer_features(
+        raw
     )
 
-    scores = feature_matrix(frame) @ weights
+    scores = (
+        feature_matrix(frame)
+        @ weights
+    )
 
     order = _ordered_indices(
         frame,
         scores,
     )
 
-    ranked = frame.iloc[order].copy().reset_index(drop=True)
-    ranked["m9_score"] = scores[order]
-    ranked["m9_rank"] = np.arange(1, len(ranked) + 1)
+    ranked = (
+        frame.iloc[order]
+        .copy()
+        .reset_index(drop=True)
+    )
 
-    ranked["agreement_top4_votes"] = (
-        (ranked["m8_rank_win"] <= 4).astype(int)
-        + (ranked["m8_rank_place"] <= 4).astype(int)
-        + (ranked["neural_rank"] <= 4).astype(int)
-        + (ranked["market_rank"] <= 4).astype(int)
+    ranked["m9_score"] = scores[order]
+    ranked["m9_rank"] = np.arange(
+        1,
+        len(ranked) + 1,
     )
 
     ranked["horse_name"] = (
@@ -1304,18 +1570,28 @@ def rank_with_m9(
     return ranked
 
 
-def load_future_multi(day: date) -> dict:
-    supports = discover_multi_supports(
-        day.isoformat(),
-        day.isoformat(),
+def future_supports(
+    day: date,
+) -> pd.DataFrame:
+    # Pour le futur, pas de rapport définitif évidemment :
+    # on utilise les vrais codes E_MULTI / E_MINI_MULTI du programme.
+    return programme_multi_candidates(
+        day,
+        day,
     )
+
+
+def future_data(
+    day: date,
+) -> dict:
+    supports = future_supports(day)
 
     races = load_races(
         day,
         day,
     )
 
-    mapped = map_supports_to_races(
+    mapped = map_pmu_to_db(
         supports,
         races,
     )
@@ -1338,30 +1614,40 @@ def load_future_multi(day: date) -> dict:
             "frames": {},
         }
 
-    mapped_ok["race_id"] = mapped_ok["race_id"].astype(int)
-
-    predictions = load_predictions(
-        sorted(mapped_ok["race_id"].unique().tolist())
+    mapped_ok["race_id"] = pd.to_numeric(
+        mapped_ok["race_id"],
+        errors="coerce",
     )
 
-    frames = paired_prediction_frames(
-        predictions
+    mapped_ok = mapped_ok[
+        mapped_ok["race_id"].notna()
+    ].copy()
+
+    mapped_ok["race_id"] = (
+        mapped_ok["race_id"].astype(int)
+    )
+
+    predictions = load_predictions(
+        sorted(
+            mapped_ok["race_id"]
+            .unique()
+            .tolist()
+        )
     )
 
     return {
         "supports": supports,
         "mapped": mapped,
-        "frames": frames,
+        "frames": paired_frames(predictions),
     }
 
 
 # =============================================================================
-# UI : SIDEBAR
+# UI
 # =============================================================================
 
 with st.sidebar:
-    st.header("⚙️ Multi M9")
-
+    st.header("⚙️ Multi M9 V2")
     st.write(f"**Version :** `{APP_VERSION}`")
     st.write("**Model #8 :** gelé")
     st.write("**Neural #9 :** gelé")
@@ -1370,254 +1656,259 @@ with st.sidebar:
         f"{CALIBRATION_START.strftime('%d/%m/%Y')} → "
         f"{CALIBRATION_END.strftime('%d/%m/%Y')}"
     )
-    st.write(f"**Objectif :** maximiser le Multi 4 / {EXPECTED_MULTI_SUPPORTS}")
+    st.write("**Cohorte attendue :** 84")
 
-    st.divider()
+    if "m9v2" in st.session_state:
+        cal = st.session_state["m9v2"]
 
-    if "multi_m9_calibration" in st.session_state:
-        cal = st.session_state["multi_m9_calibration"]
-        st.success(
-            f"M9 calibré : {cal['metrics']['hits4']}/"
-            f"{cal['metrics']['eligible4']} Multi 4"
-        )
-        st.caption(
-            "Empreinte : "
-            + cal["fingerprint"][:12]
-            + "…"
-        )
-    else:
-        st.info("Calibration non chargée dans cette session.")
+        if cal["lock_ok"]:
+            st.success(
+                "✅ Calibration cohérente et verrouillable"
+            )
+        else:
+            st.error(
+                "⚠️ Calibration non verrouillable"
+            )
 
-
-# =============================================================================
-# UI : ONGLETS
-# =============================================================================
 
 tab_cal, tab_live, tab_method = st.tabs(
     [
-        "🧪 Calibration 84",
+        "🧪 Calibration exacte 84",
         "🎯 Pronostics Multi",
         "📐 Méthode",
     ]
 )
 
 
-# =============================================================================
-# ONGLET CALIBRATION
-# =============================================================================
-
 with tab_cal:
-    st.subheader("🧪 Calibration spécialisée Multi")
+    st.subheader(
+        "🧪 Reconstruction et calibration exacte"
+    )
 
-    st.warning(
-        "Les 84 courses du 12 au 15 septembre servent désormais à CALIBRER M9. "
-        "Le score obtenu sur ces 84 courses n'est donc pas une validation indépendante. "
-        "Les prochaines courses seront le vrai test forward."
+    st.info(
+        "V2 n'utilise plus finish_position Supabase pour définir la cible. "
+        "Elle relit les rapports définitifs PMU et extrait la combinaison Multi gagnante."
     )
 
     if st.button(
-        "🚀 Calibrer / recalibrer Multi M9 sur les 84 courses",
+        "🚀 Reconstruire les 84 et calibrer M9 V2",
         type="primary",
         use_container_width=True,
     ):
         try:
-            st.session_state["multi_m9_calibration"] = run_calibration()
+            st.session_state["m9v2"] = (
+                run_calibration()
+            )
         except Exception as exc:
             st.exception(exc)
 
-    cal = st.session_state.get("multi_m9_calibration")
+    cal = st.session_state.get("m9v2")
 
     if cal is not None:
+        pmu_all = cal["pmu_all"]
+        pmu_cohort = cal["pmu_cohort"]
+        cache = cal["cache"]
+
         c1, c2, c3, c4 = st.columns(4)
 
         c1.metric(
-            "Supports PMU Multi détectés",
-            cal["support_count"],
-            delta=(
-                "OK"
-                if cal["support_count"] == EXPECTED_MULTI_SUPPORTS
-                else f"attendu {EXPECTED_MULTI_SUPPORTS}"
-            ),
+            "Candidats exacts E_MULTI / E_MINI_MULTI",
+            len(pmu_all),
         )
 
         c2.metric(
-            "Supports raccordés Supabase",
-            cal["mapped_count"],
+            "Rapports Multi Top4 exploitables",
+            len(pmu_cohort),
+            delta=(
+                "OK = 84"
+                if len(pmu_cohort) == EXPECTED_COHORT
+                else "attendu 84"
+            ),
         )
 
         c3.metric(
             "Courses exploitables M8 + Neural",
-            cal["usable_count"],
-        )
-
-        delta_hits = (
-            cal["metrics"]["hits4"]
-            - cal["baseline_m8"]["hits4"]
+            len(cache),
+            delta=(
+                "OK = 84"
+                if len(cache) == EXPECTED_COHORT
+                else "attendu 84"
+            ),
         )
 
         c4.metric(
-            "Multi 4 touchés par M9",
-            f"{cal['metrics']['hits4']}/{cal['metrics']['eligible4']}",
-            delta=f"{delta_hits:+d} vs M8",
+            "Multi4 M9 optimisé",
+            f"{cal['optimized']['hits4']}/"
+            f"{cal['optimized']['eligible4']}",
         )
 
         st.divider()
 
-        sanity_ok = (
-            cal["support_count"] == EXPECTED_MULTI_SUPPORTS
-            and cal["usable_count"] == EXPECTED_MULTI_SUPPORTS
-            and all(
-                cal["baseline_m8"][f"hits{size}"] == expected
-                for size, expected in EXPECTED_M8_HITS.items()
-            )
-        )
-
-        if sanity_ok:
-            st.success(
-                "✅ Sanity check validé : on retrouve bien la référence M8 "
-                "5/84 en Multi4, 15/84 en Top5 et 23/84 en Top6."
-            )
-        else:
-            observed = ", ".join(
-                f"Top{size}={cal['baseline_m8'][f'hits{size}']}"
-                for size in (4, 5, 6)
-            )
-            st.error(
-                "⚠️ La référence historique n'est pas reproduite exactement. "
-                f"Observé : {observed}. "
-                "Ne considère pas la calibration comme définitive tant que cet écart "
-                "n'est pas audité."
-            )
-
         comparison = pd.DataFrame(
             [
                 {
-                    "Stratégie": "M8 win — référence",
-                    "Multi4": cal["baseline_m8"]["hits4"],
-                    "Top5 contient les 4": cal["baseline_m8"]["hits5"],
-                    "Top6 contient les 4": cal["baseline_m8"]["hits6"],
-                    "Top7 contient les 4": cal["baseline_m8"]["hits7"],
+                    "Stratégie": "M8 win",
+                    "Multi4": cal["m8_win"]["hits4"],
+                    "Top5 contient les 4": cal["m8_win"]["hits5"],
+                    "Top6 contient les 4": cal["m8_win"]["hits6"],
+                    "Top7 contient les 4": cal["m8_win"]["hits7"],
                 },
                 {
                     "Stratégie": "M8 place",
-                    "Multi4": cal["baseline_m8_place"]["hits4"],
-                    "Top5 contient les 4": cal["baseline_m8_place"]["hits5"],
-                    "Top6 contient les 4": cal["baseline_m8_place"]["hits6"],
-                    "Top7 contient les 4": cal["baseline_m8_place"]["hits7"],
+                    "Multi4": cal["m8_place"]["hits4"],
+                    "Top5 contient les 4": cal["m8_place"]["hits5"],
+                    "Top6 contient les 4": cal["m8_place"]["hits6"],
+                    "Top7 contient les 4": cal["m8_place"]["hits7"],
                 },
                 {
                     "Stratégie": "Neural #9",
-                    "Multi4": cal["baseline_neural"]["hits4"],
-                    "Top5 contient les 4": cal["baseline_neural"]["hits5"],
-                    "Top6 contient les 4": cal["baseline_neural"]["hits6"],
-                    "Top7 contient les 4": cal["baseline_neural"]["hits7"],
+                    "Multi4": cal["neural"]["hits4"],
+                    "Top5 contient les 4": cal["neural"]["hits5"],
+                    "Top6 contient les 4": cal["neural"]["hits6"],
+                    "Top7 contient les 4": cal["neural"]["hits7"],
                 },
                 {
-                    "Stratégie": "🏇 Multi M9 optimisé",
-                    "Multi4": cal["metrics"]["hits4"],
-                    "Top5 contient les 4": cal["metrics"]["hits5"],
-                    "Top6 contient les 4": cal["metrics"]["hits6"],
-                    "Top7 contient les 4": cal["metrics"]["hits7"],
+                    "Stratégie": "🏇 Multi M9 V2 optimisé",
+                    "Multi4": cal["optimized"]["hits4"],
+                    "Top5 contient les 4": cal["optimized"]["hits5"],
+                    "Top6 contient les 4": cal["optimized"]["hits6"],
+                    "Top7 contient les 4": cal["optimized"]["hits7"],
                 },
             ]
         )
 
-        st.markdown("#### Comparaison sur les 84 courses")
         st.dataframe(
             comparison,
             use_container_width=True,
             hide_index=True,
         )
 
-        st.markdown("#### Poids optimaux M9")
+        if cal["reference_column"] is not None:
+            st.success(
+                "✅ Référence historique reproduite : "
+                f"{cal['reference_name']} = "
+                f"{EXPECTED_M8[4]}/84 en Top4, "
+                f"{EXPECTED_M8[5]}/84 en Top5, "
+                f"{EXPECTED_M8[6]}/84 en Top6."
+            )
+        else:
+            st.error(
+                "❌ La référence M8 5/84 — 15/84 — 23/84 "
+                "n'est toujours pas reproduite. "
+                "Ne fige pas les poids : l'audit doit continuer."
+            )
 
-        weights_df = pd.DataFrame(
-            {
-                "Signal": SIGNAL_NAMES,
-                "Poids": cal["weights"],
-                "Poids %": [
-                    f"{100*x:.0f}%"
-                    for x in cal["weights"]
-                ],
-            }
-        )
+        if cal["lock_ok"]:
+            gain = (
+                cal["optimized"]["hits4"]
+                - EXPECTED_M8[4]
+            )
+
+            st.success(
+                f"🔒 Calibration cohérente : M9 V2 gagne {gain:+d} "
+                "Multi4 sur la cohorte de calibration par rapport au 5/84 de référence."
+            )
+        else:
+            st.warning(
+                "La configuration reste DIAGNOSTIQUE : "
+                "pas de gel tant que cohorte=84 et référence M8 ne sont pas toutes deux validées."
+            )
+
+        st.markdown("#### Poids optimaux")
 
         st.dataframe(
-            weights_df,
+            pd.DataFrame(
+                {
+                    "Signal": SIGNAL_NAMES,
+                    "Poids": cal["weights"],
+                    "Poids %": [
+                        f"{100*x:.0f}%"
+                        for x in cal["weights"]
+                    ],
+                }
+            ),
             use_container_width=True,
             hide_index=True,
         )
 
-        st.caption(
-            f"Recherche exhaustive : pas de {GRID_STEP:.2f}, "
-            f"{len(cal['leaderboard'])} meilleures configurations conservées. "
-            "L'optimiseur teste 10 626 combinaisons de poids."
-        )
-
-        with st.expander("🏆 Top configurations proches de l'optimum"):
+        with st.expander(
+            "🏆 Top 30 configurations"
+        ):
             st.dataframe(
                 cal["leaderboard"],
                 use_container_width=True,
                 hide_index=True,
             )
 
-        config_payload = {
-            "name": APP_NAME,
-            "version": APP_VERSION,
-            "calibration_start": CALIBRATION_START.isoformat(),
-            "calibration_end": CALIBRATION_END.isoformat(),
-            "expected_supports": EXPECTED_MULTI_SUPPORTS,
-            "model8_id": MODEL8_ID,
-            "model8_hash": MODEL8_HASH,
-            "neural_id": NEURAL_ID,
-            "neural_hash": NEURAL_HASH,
-            "grid_step": GRID_STEP,
-            "signals": SIGNAL_NAMES,
-            "weights": {
-                name: float(value)
-                for name, value in zip(
-                    SIGNAL_NAMES,
-                    cal["weights"],
-                )
-            },
-            "metrics": cal["metrics"],
-            "baseline_m8": cal["baseline_m8"],
-            "fingerprint": cal["fingerprint"],
-        }
-
-        st.download_button(
-            "⬇️ Télécharger la configuration M9 figée (.json)",
-            data=json.dumps(
-                config_payload,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            file_name="horseprono_multi_m9_config.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-
-        with st.expander("🔎 Audit des 84 supports"):
+        with st.expander(
+            "🔎 Audit course par course"
+        ):
             st.dataframe(
                 cal["audit"],
                 use_container_width=True,
                 hide_index=True,
             )
 
+        with st.expander(
+            "🔎 Candidats PMU + état des rapports"
+        ):
+            display = pmu_all.drop(
+                columns=["target_set"],
+                errors="ignore",
+            )
+            st.dataframe(
+                display,
+                use_container_width=True,
+                hide_index=True,
+            )
 
-# =============================================================================
-# ONGLET PRONOSTICS
-# =============================================================================
+        config = {
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "lock_ok": bool(cal["lock_ok"]),
+            "cohort_size": len(cache),
+            "reference": cal["reference_name"],
+            "weights": {
+                signal: float(weight)
+                for signal, weight
+                in zip(
+                    SIGNAL_NAMES,
+                    cal["weights"],
+                )
+            },
+            "optimized": cal["optimized"],
+            "model8_hash": MODEL8_HASH,
+            "neural_hash": NEURAL_HASH,
+            "fingerprint": cal["fingerprint"],
+        }
+
+        st.download_button(
+            "⬇️ Télécharger la configuration M9 V2",
+            data=json.dumps(
+                config,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            file_name="horseprono_multi_m9_v2_config.json",
+            mime="application/json",
+            disabled=not cal["lock_ok"],
+            use_container_width=True,
+        )
+
 
 with tab_live:
-    st.subheader("🎯 Pronostics des courses Multi")
+    st.subheader("🎯 Pronostics Multi")
 
-    cal = st.session_state.get("multi_m9_calibration")
+    cal = st.session_state.get("m9v2")
 
     if cal is None:
         st.info(
-            "Commence par l'onglet « Calibration 84 » puis clique sur "
-            "« Calibrer Multi M9 »."
+            "Lance d'abord la calibration V2."
+        )
+    elif not cal["lock_ok"]:
+        st.warning(
+            "Pronostics futurs désactivés tant que la cohorte historique "
+            "et la référence M8 ne sont pas reproduites."
         )
     else:
         selected_day = st.date_input(
@@ -1631,171 +1922,157 @@ with tab_live:
             use_container_width=True,
         ):
             try:
-                with st.spinner(
-                    "Recherche des courses Multi et des prédictions M8 + Neural…"
-                ):
-                    live = load_future_multi(
-                        selected_day
-                    )
+                live = future_data(
+                    selected_day
+                )
 
-                supports = live["supports"]
-                mapped = live["mapped"]
-                frames = live["frames"]
-
-                if supports.empty:
+                if live["supports"].empty:
                     st.warning(
-                        "Aucune course E_MULTI / E_MINI_MULTI détectée pour cette date."
+                        "Aucune course E_MULTI / E_MINI_MULTI détectée."
                     )
                 else:
-                    st.success(
-                        f"{len(supports)} course(s) Multi détectée(s)."
-                    )
-
-                    for _, row in mapped.iterrows():
+                    for _, row in live["mapped"].iterrows():
                         reunion = int(row["meeting_number"])
                         course = int(row["race_number"])
-                        label = row.get("label_pmu") or ""
+
                         hippodrome = (
                             row.get("hippodrome")
                             or row.get("hippodrome_pmu")
                             or "INCONNU"
                         )
 
-                        race_id_value = row.get("race_id")
-
-                        title = (
-                            f"R{reunion}C{course} — {hippodrome}"
-                            + (f" — {label}" if label else "")
+                        st.markdown(
+                            f"### R{reunion}C{course} — {hippodrome}"
                         )
 
-                        st.markdown(f"### {title}")
-
-                        st.caption(
-                            f"Pari PMU : {row.get('multi_codes', 'MULTI')}"
+                        race_id = _safe_int(
+                            row.get("race_id")
                         )
 
-                        if pd.isna(race_id_value):
+                        if race_id is None:
                             st.warning(
-                                "Course pas encore raccordée dans Supabase. "
-                                "Le snapshot forward M8/Neural n'a probablement "
-                                "pas encore été capturé."
+                                "Course pas encore raccordée dans Supabase."
                             )
                             continue
 
-                        race_id = int(race_id_value)
-                        raw_frame = frames.get(race_id)
+                        raw = live["frames"].get(
+                            race_id
+                        )
 
-                        if raw_frame is None or raw_frame.empty:
+                        if raw is None or raw.empty:
                             st.warning(
-                                "Pas encore de prédictions appariées M8 + Neural "
-                                "pour cette course. Le scheduler les capture "
-                                "habituellement peu avant le départ."
+                                "Snapshots M8/Neural pas encore disponibles."
                             )
                             continue
 
-                        ranked = rank_with_m9(
-                            raw_frame,
+                        ranked = rank_m9(
+                            raw,
                             cal["weights"],
                         )
 
-                        if len(ranked) < 4:
-                            st.warning(
-                                "Moins de quatre partants prédits : course non exploitable."
-                            )
-                            continue
+                        top4 = (
+                            ranked.head(4)["horse_number"]
+                            .astype(int)
+                            .tolist()
+                        )
 
-                        top4 = ranked.head(4)["horse_number"].astype(int).tolist()
-                        top5 = ranked.head(min(5, len(ranked)))["horse_number"].astype(int).tolist()
-                        top6 = ranked.head(min(6, len(ranked)))["horse_number"].astype(int).tolist()
-                        top7 = ranked.head(min(7, len(ranked)))["horse_number"].astype(int).tolist()
+                        top5 = (
+                            ranked.head(min(5, len(ranked)))["horse_number"]
+                            .astype(int)
+                            .tolist()
+                        )
+
+                        top6 = (
+                            ranked.head(min(6, len(ranked)))["horse_number"]
+                            .astype(int)
+                            .tolist()
+                        )
+
+                        top7 = (
+                            ranked.head(min(7, len(ranked)))["horse_number"]
+                            .astype(int)
+                            .tolist()
+                        )
 
                         a, b, c, d = st.columns(4)
-                        a.metric("🎯 Multi 4 M9", " - ".join(map(str, top4)))
-                        b.metric("Top 5", " - ".join(map(str, top5)))
-                        c.metric("Top 6", " - ".join(map(str, top6)))
-                        d.metric("Top 7", " - ".join(map(str, top7)))
 
-                        display = ranked.head(min(10, len(ranked))).copy()
+                        a.metric(
+                            "🎯 Multi 4 M9",
+                            " - ".join(map(str, top4)),
+                        )
 
-                        display = display[
+                        b.metric(
+                            "Top 5",
+                            " - ".join(map(str, top5)),
+                        )
+
+                        c.metric(
+                            "Top 6",
+                            " - ".join(map(str, top6)),
+                        )
+
+                        d.metric(
+                            "Top 7",
+                            " - ".join(map(str, top7)),
+                        )
+
+                        show = ranked.head(
+                            min(10, len(ranked))
+                        ).copy()
+
+                        show = show[
                             [
                                 "m9_rank",
                                 "horse_number",
                                 "horse_name",
                                 "m9_score",
-                                "agreement_top4_votes",
                                 "m8_rank_win",
                                 "m8_rank_place",
                                 "neural_rank",
                                 "market_rank",
                                 "odds",
                             ]
-                        ].rename(
-                            columns={
-                                "m9_rank": "Rang M9",
-                                "horse_number": "N°",
-                                "horse_name": "Cheval",
-                                "m9_score": "Score M9",
-                                "agreement_top4_votes": "Votes Top4 / 4",
-                                "m8_rank_win": "Rang M8 win",
-                                "m8_rank_place": "Rang M8 placé",
-                                "neural_rank": "Rang Neural",
-                                "market_rank": "Rang marché",
-                                "odds": "Cote",
-                            }
+                        ]
+
+                        show["m9_score"] = (
+                            show["m9_score"].round(4)
                         )
 
-                        display["Score M9"] = display["Score M9"].round(4)
-
                         st.dataframe(
-                            display,
+                            show,
                             use_container_width=True,
                             hide_index=True,
                         )
-
-                        st.caption(
-                            "Multi M9 = ranking figé issu de la calibration 84. "
-                            "Aucun résultat futur n'est réinjecté automatiquement."
-                        )
-
-                        st.divider()
 
             except Exception as exc:
                 st.exception(exc)
 
 
-# =============================================================================
-# ONGLET MÉTHODE
-# =============================================================================
-
 with tab_method:
-    st.subheader("📐 Comment fonctionne Multi M9 ?")
+    st.subheader("📐 Pourquoi cette V2 ?")
 
     st.markdown(
         """
-**But du modèle :** augmenter le nombre de courses où les **4 premiers à
-l'arrivée** sont contenus dans les **4 premiers chevaux sélectionnés par M9**.
+La première version avait deux défauts visibles dans ton export :
 
-M9 ne remplace pas les modèles existants. Il combine cinq signaux :
+- elle détectait **115** supports au lieu des **84** de notre analyse ;
+- elle construisait la cible avec `finish_position` Supabase, alors que
+  notre étude historique reposait sur les **rapports définitifs PMU**.
 
-1. classement gagnant du **Model #8** ;
-2. classement placé du **Model #8** ;
-3. probabilité **Top 3 du Neural #9** ;
-4. signal du **marché** ;
-5. **consensus** entre les modèles et le marché.
+V2 corrige ça en trois étages :
 
-L'optimiseur teste **10 626 combinaisons de poids** avec un pas de 5 %.  
-Le critère n°1 est le nombre de **Multi 4 touchés sur les 84 courses**.
-En cas d'égalité, il privilégie successivement la couverture Top5, Top6,
-Top7, puis les overlaps avec l'arrivée.
+1. détection stricte des codes **`E_MULTI` / `E_MINI_MULTI`** ;
+2. validation par **rapport définitif PMU** et extraction de la combinaison
+   gagnante de quatre chevaux ;
+3. audit des deux classements M8 (`rank_win` et `rank_place`) jusqu'à
+   reproduction exacte de **5/84, 15/84, 23/84**.
 
-Le résultat des 84 courses est un **score de calibration**. Une fois les
-poids choisis, ils restent figés pour les courses suivantes : les nouvelles
-courses servent alors de validation forward.
+Les poids M9 ne deviennent téléchargeables et utilisables en forward
+que si ces garde-fous sont tous validés.
         """
     )
 
-    st.info(
-        "Conseil méthodologique : ne change pas les poids après chaque course future. "
-        "On accumule d'abord un vrai échantillon forward, puis on réévalue."
+    st.warning(
+        "Même après validation, le score obtenu sur les 84 courses est un score "
+        "de calibration. Il faut figer les poids et juger ensuite M9 sur de nouvelles courses."
     )

@@ -27,7 +27,7 @@ from supabase import create_client
 # =============================================================================
 
 APP_NAME = "HorseProno Multi M9"
-APP_VERSION = "M9-MULTI-V2"
+APP_VERSION = "M9-MULTI-V3"
 
 PMU_BASE_URL = "https://online.turfinfo.api.pmu.fr/rest/client/1"
 REQUEST_TIMEOUT = 25
@@ -78,10 +78,10 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🏇 HorseProno Multi M9 — V2")
+st.title("🏇 HorseProno Multi M9 — V3")
 st.caption(
-    "Méta-modèle spécialisé Multi. V2 reconstruit d'abord exactement la cohorte "
-    "PMU à partir des rapports définitifs, puis calibre le sélecteur."
+    "Méta-modèle spécialisé Multi. V3 reconstruit la cohorte historique exacte de 84 "
+    "courses avant toute optimisation."
 )
 
 
@@ -603,6 +603,96 @@ def load_races(start: date, end: date) -> pd.DataFrame:
 def _chunks(values: list[int], size: int):
     for i in range(0, len(values), size):
         yield values[i : i + size]
+
+
+
+def load_participants(race_ids: list[int]) -> pd.DataFrame:
+    if not race_ids:
+        return pd.DataFrame()
+
+    client = get_client()
+    output: list[dict] = []
+
+    for chunk in _chunks(race_ids, 30):
+        response = (
+            client.table("participants")
+            .select(
+                "id,race_id,horse_name,horse_number,"
+                "finish_position,is_non_runner"
+            )
+            .in_("race_id", chunk)
+            .execute()
+        )
+
+        output.extend(_rows(response))
+
+    if not output:
+        return pd.DataFrame()
+
+    return pd.DataFrame(output)
+
+
+def historical_finish_targets(
+    participants: pd.DataFrame,
+) -> dict[int, frozenset[int]]:
+    """
+    Reproduit le critère d'exploitabilité de l'analyse historique initiale :
+    les quatre positions d'arrivée 1 à 4 doivent être présentes en base.
+    """
+    result: dict[int, frozenset[int]] = {}
+
+    if participants.empty:
+        return result
+
+    data = participants.copy()
+
+    data["race_id"] = pd.to_numeric(
+        data["race_id"],
+        errors="coerce",
+    )
+    data["horse_number"] = pd.to_numeric(
+        data["horse_number"],
+        errors="coerce",
+    )
+    data["finish_position"] = pd.to_numeric(
+        data["finish_position"],
+        errors="coerce",
+    )
+
+    if "is_non_runner" in data.columns:
+        data = data[
+            data["is_non_runner"].fillna(False) != True
+        ].copy()
+
+    data = data[
+        data["race_id"].notna()
+        & data["horse_number"].notna()
+        & data["finish_position"].between(1, 4)
+    ].copy()
+
+    for race_id, group in data.groupby("race_id"):
+        # Une position 1,2,3,4 chacune, donc exactement 4 chevaux exploitables.
+        positions = set(
+            int(x)
+            for x in group["finish_position"].tolist()
+        )
+
+        if positions != {1, 2, 3, 4}:
+            continue
+
+        ordered = group.sort_values(
+            ["finish_position", "horse_number"]
+        )
+
+        if len(ordered) != 4:
+            continue
+
+        result[int(race_id)] = frozenset(
+            int(x)
+            for x in ordered["horse_number"].tolist()
+        )
+
+    return result
 
 
 def load_predictions(race_ids: list[int]) -> pd.DataFrame:
@@ -1162,7 +1252,7 @@ def optimize(
 
     progress = st.progress(
         0.0,
-        text="Optimisation M9 V2…",
+        text="Optimisation M9 V3…",
     )
 
     best_weights = None
@@ -1222,7 +1312,7 @@ def optimize(
             progress.progress(
                 i / total,
                 text=(
-                    f"Optimisation M9 V2 : "
+                    f"Optimisation M9 V3 : "
                     f"{i:,}/{total:,}"
                 ),
             )
@@ -1282,9 +1372,8 @@ def build_calibration_package() -> dict:
             "Aucun support Multi PMU détecté."
         )
 
-    # La cohorte historique est définie par un VRAI rapport Multi
-    # dont la combinaison Top4 est exploitable.
-    pmu_cohort = pmu_all[
+    # Etage 1 : vrais rapports Multi avec cible Top4 PMU exploitable.
+    pmu_reports_ok = pmu_all[
         pmu_all["report_ok"] == True
     ].copy()
 
@@ -1294,30 +1383,27 @@ def build_calibration_package() -> dict:
     )
 
     mapped = map_pmu_to_db(
-        pmu_cohort,
+        pmu_reports_ok,
         races,
     )
 
     if mapped.empty or "race_id" not in mapped.columns:
         return {
             "pmu_all": pmu_all,
-            "pmu_cohort": pmu_cohort,
+            "pmu_reports_ok": pmu_reports_ok,
+            "historical_complete": pd.DataFrame(),
             "mapped": mapped,
             "cache": [],
             "audit": pd.DataFrame(),
         }
 
-    mapped_ok = mapped[
-        mapped["race_id"].notna()
-    ].copy()
-
-    mapped_ok["race_id"] = pd.to_numeric(
-        mapped_ok["race_id"],
+    mapped["race_id"] = pd.to_numeric(
+        mapped["race_id"],
         errors="coerce",
     )
 
-    mapped_ok = mapped_ok[
-        mapped_ok["race_id"].notna()
+    mapped_ok = mapped[
+        mapped["race_id"].notna()
     ].copy()
 
     mapped_ok["race_id"] = (
@@ -1328,6 +1414,17 @@ def build_calibration_package() -> dict:
         mapped_ok["race_id"].unique().tolist()
     )
 
+    # Etage 2 : reproduire exactement la condition "résultats complets"
+    # qui définissait le bloc historique de 84 courses.
+    participants = load_participants(
+        race_ids
+    )
+
+    finish_targets = historical_finish_targets(
+        participants
+    )
+
+    # Etage 3 : prédictions gelées M8 + Neural.
     predictions = load_predictions(
         race_ids
     )
@@ -1338,13 +1435,19 @@ def build_calibration_package() -> dict:
 
     cache: list[dict] = []
     audit_rows: list[dict] = []
+    complete_rows: list[dict] = []
 
     for _, row in mapped.iterrows():
         race_id = _safe_int(
             row.get("race_id")
         )
 
-        target = row.get("target_set")
+        pmu_target = row.get("target_set")
+        finish_target = (
+            finish_targets.get(race_id)
+            if race_id is not None
+            else None
+        )
         raw = (
             frames.get(race_id)
             if race_id is not None
@@ -1356,8 +1459,14 @@ def build_calibration_package() -> dict:
         if race_id is None:
             reason = "course absente Supabase"
 
-        elif not isinstance(target, frozenset) or len(target) != 4:
+        elif not isinstance(pmu_target, frozenset) or len(pmu_target) != 4:
             reason = "cible PMU Top4 invalide"
+
+        elif not isinstance(finish_target, frozenset) or len(finish_target) != 4:
+            reason = "arrivée Top4 Supabase indisponible"
+
+        elif pmu_target != finish_target:
+            reason = "désaccord PMU / arrivée Supabase"
 
         elif raw is None or raw.empty:
             reason = "prédictions M8/Neural absentes"
@@ -1371,8 +1480,8 @@ def build_calibration_package() -> dict:
                 for x in raw["horse_number"].tolist()
             )
 
-            if not target.issubset(predicted_numbers):
-                reason = "un cheval du Top4 PMU absent des prédictions"
+            if not pmu_target.issubset(predicted_numbers):
+                reason = "un cheval du Top4 absent des prédictions"
 
         usable = reason == ""
 
@@ -1383,8 +1492,13 @@ def build_calibration_package() -> dict:
                 "race_number": row.get("race_number"),
                 "race_id": race_id,
                 "multi_codes": row.get("multi_codes"),
-                "target_top4": row.get("target_top4"),
-                "usable": usable,
+                "target_top4_pmu": row.get("target_top4"),
+                "target_top4_supabase": (
+                    "-".join(map(str, sorted(finish_target)))
+                    if isinstance(finish_target, frozenset)
+                    else ""
+                ),
+                "usable_84": usable,
                 "reason": reason,
                 "paired_horses": (
                     len(raw)
@@ -1396,6 +1510,10 @@ def build_calibration_package() -> dict:
 
         if not usable:
             continue
+
+        complete_rows.append(
+            row.to_dict()
+        )
 
         frame = engineer_features(
             raw
@@ -1413,19 +1531,26 @@ def build_calibration_package() -> dict:
                     or "INCONNU"
                 ),
                 "label_pmu": row.get("label_pmu"),
-                "target": target,
+                "multi_codes": row.get("multi_codes"),
+                "target": pmu_target,
                 "frame": frame,
                 "matrix": feature_matrix(frame),
             }
         )
 
+    historical_complete = pd.DataFrame(
+        complete_rows
+    )
+
     return {
         "pmu_all": pmu_all,
-        "pmu_cohort": pmu_cohort,
+        "pmu_reports_ok": pmu_reports_ok,
+        "historical_complete": historical_complete,
         "mapped": mapped,
         "cache": cache,
         "audit": pd.DataFrame(audit_rows),
     }
+
 
 
 def _matches_expected(
@@ -1488,7 +1613,7 @@ def run_calibration() -> dict:
     )
 
     lock_ok = (
-        len(package["pmu_cohort"]) == EXPECTED_COHORT
+        len(package["historical_complete"]) == EXPECTED_COHORT
         and len(cache) == EXPECTED_COHORT
         and reference_column is not None
     )
@@ -1647,7 +1772,7 @@ def future_data(
 # =============================================================================
 
 with st.sidebar:
-    st.header("⚙️ Multi M9 V2")
+    st.header("⚙️ Multi M9 V3")
     st.write(f"**Version :** `{APP_VERSION}`")
     st.write("**Model #8 :** gelé")
     st.write("**Neural #9 :** gelé")
@@ -1659,7 +1784,7 @@ with st.sidebar:
     st.write("**Cohorte attendue :** 84")
 
     if "m9v2" in st.session_state:
-        cal = st.session_state["m9v2"]
+        cal = st.session_state["m9v3"]
 
         if cal["lock_ok"]:
             st.success(
@@ -1673,7 +1798,7 @@ with st.sidebar:
 
 tab_cal, tab_live, tab_method = st.tabs(
     [
-        "🧪 Calibration exacte 84",
+        "🧪 Calibration exacte 84 — V3",
         "🎯 Pronostics Multi",
         "📐 Méthode",
     ]
@@ -1686,27 +1811,28 @@ with tab_cal:
     )
 
     st.info(
-        "V2 n'utilise plus finish_position Supabase pour définir la cible. "
+        "V3 n'utilise plus finish_position Supabase pour définir la cible. "
         "Elle relit les rapports définitifs PMU et extrait la combinaison Multi gagnante."
     )
 
     if st.button(
-        "🚀 Reconstruire les 84 et calibrer M9 V2",
+        "🚀 Reconstruire les 84 et calibrer M9 V3",
         type="primary",
         use_container_width=True,
     ):
         try:
-            st.session_state["m9v2"] = (
+            st.session_state["m9v3"] = (
                 run_calibration()
             )
         except Exception as exc:
             st.exception(exc)
 
-    cal = st.session_state.get("m9v2")
+    cal = st.session_state.get("m9v3")
 
     if cal is not None:
         pmu_all = cal["pmu_all"]
-        pmu_cohort = cal["pmu_cohort"]
+        pmu_reports_ok = cal["pmu_reports_ok"]
+        historical_complete = cal["historical_complete"]
         cache = cal["cache"]
 
         c1, c2, c3, c4 = st.columns(4)
@@ -1718,20 +1844,15 @@ with tab_cal:
 
         c2.metric(
             "Rapports Multi Top4 exploitables",
-            len(pmu_cohort),
-            delta=(
-                "OK = 84"
-                if len(pmu_cohort) == EXPECTED_COHORT
-                else "attendu 84"
-            ),
+            len(pmu_reports_ok),
         )
 
         c3.metric(
-            "Courses exploitables M8 + Neural",
-            len(cache),
+            "Cohorte historique complète",
+            len(historical_complete),
             delta=(
                 "OK = 84"
-                if len(cache) == EXPECTED_COHORT
+                if len(historical_complete) == EXPECTED_COHORT
                 else "attendu 84"
             ),
         )
@@ -1741,6 +1862,16 @@ with tab_cal:
             f"{cal['optimized']['hits4']}/"
             f"{cal['optimized']['eligible4']}",
         )
+
+        if len(cache) == EXPECTED_COHORT:
+            st.success(
+                "✅ 84/84 courses ont une cible PMU, une arrivée complète "
+                "et les prédictions M8 + Neural appariées."
+            )
+        else:
+            st.error(
+                f"❌ Cohorte finale exploitable : {len(cache)} au lieu de 84."
+            )
 
         st.divider()
 
@@ -1768,7 +1899,7 @@ with tab_cal:
                     "Top7 contient les 4": cal["neural"]["hits7"],
                 },
                 {
-                    "Stratégie": "🏇 Multi M9 V2 optimisé",
+                    "Stratégie": "🏇 Multi M9 V3 optimisé",
                     "Multi4": cal["optimized"]["hits4"],
                     "Top5 contient les 4": cal["optimized"]["hits5"],
                     "Top6 contient les 4": cal["optimized"]["hits6"],
@@ -1805,7 +1936,7 @@ with tab_cal:
             )
 
             st.success(
-                f"🔒 Calibration cohérente : M9 V2 gagne {gain:+d} "
+                f"🔒 Calibration cohérente : M9 V3 gagne {gain:+d} "
                 "Multi4 sur la cohorte de calibration par rapport au 5/84 de référence."
             )
         else:
@@ -1883,13 +2014,13 @@ with tab_cal:
         }
 
         st.download_button(
-            "⬇️ Télécharger la configuration M9 V2",
+            "⬇️ Télécharger la configuration M9 V3",
             data=json.dumps(
                 config,
                 ensure_ascii=False,
                 indent=2,
             ),
-            file_name="horseprono_multi_m9_v2_config.json",
+            file_name="horseprono_multi_m9_v3_config.json",
             mime="application/json",
             disabled=not cal["lock_ok"],
             use_container_width=True,
@@ -1899,7 +2030,7 @@ with tab_cal:
 with tab_live:
     st.subheader("🎯 Pronostics Multi")
 
-    cal = st.session_state.get("m9v2")
+    cal = st.session_state.get("m9v3")
 
     if cal is None:
         st.info(
@@ -2049,30 +2180,33 @@ with tab_live:
 
 
 with tab_method:
-    st.subheader("📐 Pourquoi cette V2 ?")
+    st.subheader("📐 Pourquoi cette V3 ?")
 
     st.markdown(
         """
-La première version avait deux défauts visibles dans ton export :
+Les exports V1 et V2 ont permis de reconstruire précisément la cohorte initiale :
 
-- elle détectait **115** supports au lieu des **84** de notre analyse ;
-- elle construisait la cible avec `finish_position` Supabase, alors que
-  notre étude historique reposait sur les **rapports définitifs PMU**.
+- **111** courses portent réellement `E_MULTI` ou `E_MINI_MULTI`;
+- **109** ont un rapport définitif Multi dont le Top4 est exploitable;
+- parmi elles, **84** ont aussi les quatre positions d'arrivée complètes dans
+  Supabase **et** les prédictions gelées M8 + Neural disponibles.
 
-V2 corrige ça en trois étages :
+Cette intersection est exactement le bloc historique utilisé dans notre première
+analyse. Sur ces 84 courses, le classement **M8 place** doit reproduire :
 
-1. détection stricte des codes **`E_MULTI` / `E_MINI_MULTI`** ;
-2. validation par **rapport définitif PMU** et extraction de la combinaison
-   gagnante de quatre chevaux ;
-3. audit des deux classements M8 (`rank_win` et `rank_place`) jusqu'à
-   reproduction exacte de **5/84, 15/84, 23/84**.
+- **5/84** avec 4 chevaux;
+- **15/84** avec 5 chevaux;
+- **23/84** avec 6 chevaux.
 
-Les poids M9 ne deviennent téléchargeables et utilisables en forward
-que si ces garde-fous sont tous validés.
+V3 exige aussi que le Top4 du rapport PMU soit identique au Top4 enregistré
+dans Supabase. Si ce contrôle échoue, la course est rejetée.
+
+Une fois les 84 retrouvées, l'optimiseur teste les **10 626** combinaisons de
+poids et cherche en priorité à maximiser le nombre de Multi4 complets.
         """
     )
 
     st.warning(
-        "Même après validation, le score obtenu sur les 84 courses est un score "
-        "de calibration. Il faut figer les poids et juger ensuite M9 sur de nouvelles courses."
+        "Le meilleur score sur les 84 reste un score de calibration. "
+        "Après choix des poids, ils doivent être figés avant les nouvelles courses."
     )

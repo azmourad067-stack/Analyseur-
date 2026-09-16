@@ -16,9 +16,12 @@ from sklearn.ensemble import (
     ExtraTreesClassifier,
     GradientBoostingClassifier,
     RandomForestClassifier,
+    ExtraTreesRegressor,
+    GradientBoostingRegressor,
+    RandomForestRegressor,
 )
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -38,7 +41,7 @@ from sklearn.preprocessing import StandardScaler
 # =============================================================================
 
 APP_NAME = "HorseProno Multi M9"
-APP_VERSION = "M9-MULTI-V5-SELECTOR"
+APP_VERSION = "M9-MULTI-V6-COMBORANKER"
 
 PMU_BASE_URL = "https://online.turfinfo.api.pmu.fr/rest/client/1"
 REQUEST_TIMEOUT = 25
@@ -98,9 +101,9 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🏇 HorseProno Multi M9 — V5 Selector")
+st.title("🏇 HorseProno Multi M9 — V6 ComboRanker")
 st.caption(
-    "V5 Selector : pool Top6 M8 placé + Neural + marché, puis sélection intelligente de 4 chevaux."
+    "V6 ComboRanker : il évalue directement toutes les combinaisons de 4 chevaux dans le pool Top6."
 )
 
 
@@ -2230,6 +2233,784 @@ def selector_live_rank(
 
 
 
+
+# =============================================================================
+# V6 COMBORANKER — EVALUATION DIRECTE DES QUARTETS
+# =============================================================================
+
+def _safe_mean(values) -> float:
+    arr = pd.to_numeric(
+        pd.Series(values),
+        errors="coerce",
+    ).to_numpy(float)
+
+    arr = arr[np.isfinite(arr)]
+
+    if len(arr) == 0:
+        return 0.0
+
+    return float(np.mean(arr))
+
+
+def _safe_std(values) -> float:
+    arr = pd.to_numeric(
+        pd.Series(values),
+        errors="coerce",
+    ).to_numpy(float)
+
+    arr = arr[np.isfinite(arr)]
+
+    if len(arr) <= 1:
+        return 0.0
+
+    return float(np.std(arr))
+
+
+def _safe_min(values) -> float:
+    arr = pd.to_numeric(
+        pd.Series(values),
+        errors="coerce",
+    ).to_numpy(float)
+
+    arr = arr[np.isfinite(arr)]
+
+    return float(np.min(arr)) if len(arr) else 0.0
+
+
+def _safe_max(values) -> float:
+    arr = pd.to_numeric(
+        pd.Series(values),
+        errors="coerce",
+    ).to_numpy(float)
+
+    arr = arr[np.isfinite(arr)]
+
+    return float(np.max(arr)) if len(arr) else 0.0
+
+
+def quartet_feature_row(
+    item: dict,
+    pool: pd.DataFrame,
+    chosen_idx: tuple[int, int, int, int],
+    include_target: bool,
+) -> dict:
+    chosen = pool.iloc[list(chosen_idx)].copy()
+    excluded = pool.drop(
+        pool.index[list(chosen_idx)]
+    ).copy()
+
+    row: dict[str, Any] = {
+        "race_id_combo": int(item["race_id"]),
+        "selection_tuple": tuple(
+            sorted(
+                int(x)
+                for x in chosen["horse_number"].tolist()
+            )
+        ),
+        "discipline_combo": str(
+            item.get("discipline") or "INCONNU"
+        ).upper(),
+        "pool_size": float(len(pool)),
+        "field_size": float(
+            _safe_int(item.get("field_size"))
+            or len(item["frame"])
+        ),
+        "is_e_multi": int(
+            "E_MULTI" in str(item.get("multi_codes") or "").upper()
+            and "E_MINI_MULTI" not in str(item.get("multi_codes") or "").upper()
+        ),
+        "is_mini_multi": int(
+            "E_MINI_MULTI" in str(item.get("multi_codes") or "").upper()
+        ),
+    }
+
+    # Variables continues et de rang : résumé du quartet sélectionné.
+    numeric_cols = [
+        "m8_rank_place",
+        "neural_rank",
+        "market_rank",
+        "m8_rank_win",
+        "best_rank",
+        "mean_rank",
+        "worst_rank",
+        "rank_std",
+        "rank_range",
+        "m8_place_probability",
+        "neural_top3_probability",
+        "market_probability",
+        "m8_win_probability",
+        "sig_m8_place",
+        "sig_neural_top3",
+        "sig_market",
+        "sig_m8_win",
+        "odds",
+        "log_odds",
+        "votes_top3",
+        "votes_top4",
+        "votes_top5",
+        "votes_top6",
+    ]
+
+    for col in numeric_cols:
+        values = chosen[col] if col in chosen.columns else pd.Series(dtype=float)
+
+        row[f"{col}_sum"] = float(
+            pd.to_numeric(
+                values,
+                errors="coerce",
+            ).fillna(0.0).sum()
+        )
+        row[f"{col}_mean"] = _safe_mean(values)
+        row[f"{col}_min"] = _safe_min(values)
+        row[f"{col}_max"] = _safe_max(values)
+        row[f"{col}_std"] = _safe_std(values)
+
+        # Comparaison quartet vs chevaux laissés de côté.
+        if len(excluded):
+            excl_values = (
+                excluded[col]
+                if col in excluded.columns
+                else pd.Series(dtype=float)
+            )
+            row[f"{col}_delta_excluded_mean"] = (
+                _safe_mean(values)
+                - _safe_mean(excl_values)
+            )
+        else:
+            row[f"{col}_delta_excluded_mean"] = 0.0
+
+    # Compteurs de consensus / divergence.
+    binary_cols = [
+        "only_m8_top6",
+        "only_neural_top6",
+        "only_market_top6",
+        "m8_and_neural_top6",
+        "m8_and_market_top6",
+        "neural_and_market_top6",
+        "all3_top6",
+    ]
+
+    for col in binary_cols:
+        row[f"{col}_count"] = int(
+            pd.to_numeric(
+                chosen[col],
+                errors="coerce",
+            ).fillna(0).sum()
+        )
+
+    # Combien des Top4 de chaque source sont retenus.
+    row["count_m8_top4"] = int(
+        (pd.to_numeric(chosen["m8_rank_place"], errors="coerce") <= 4).sum()
+    )
+    row["count_neural_top4"] = int(
+        (pd.to_numeric(chosen["neural_rank"], errors="coerce") <= 4).sum()
+    )
+    row["count_market_top4"] = int(
+        (pd.to_numeric(chosen["market_rank"], errors="coerce") <= 4).sum()
+    )
+
+    row["sum_three_source_top4"] = (
+        row["count_m8_top4"]
+        + row["count_neural_top4"]
+        + row["count_market_top4"]
+    )
+
+    row["count_votes3_top4"] = int(
+        (pd.to_numeric(chosen["votes_top4"], errors="coerce") == 3).sum()
+    )
+    row["count_votes2plus_top4"] = int(
+        (pd.to_numeric(chosen["votes_top4"], errors="coerce") >= 2).sum()
+    )
+    row["count_votes3_top6"] = int(
+        (pd.to_numeric(chosen["votes_top6"], errors="coerce") == 3).sum()
+    )
+
+    if include_target:
+        target = set(item.get("target") or [])
+        overlap = len(
+            target.intersection(
+                set(
+                    int(x)
+                    for x in chosen["horse_number"].tolist()
+                )
+            )
+        )
+        row["overlap_target"] = int(overlap)
+        row["exact_target"] = int(overlap == 4)
+
+    return row
+
+
+def combo_dataset(
+    cache: list[dict],
+    include_target: bool = True,
+) -> pd.DataFrame:
+    import itertools
+
+    rows: list[dict] = []
+
+    for item in cache:
+        pool = candidate_pool(
+            item,
+            include_target=include_target,
+        )
+
+        if len(pool) < 4:
+            continue
+
+        for combo in itertools.combinations(
+            range(len(pool)),
+            4,
+        ):
+            rows.append(
+                quartet_feature_row(
+                    item,
+                    pool,
+                    combo,
+                    include_target=include_target,
+                )
+            )
+
+    return pd.DataFrame(rows)
+
+
+def combo_matrix(
+    df: pd.DataFrame,
+    feature_columns: list[str] | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    excluded = {
+        "race_id_combo",
+        "selection_tuple",
+        "discipline_combo",
+        "overlap_target",
+        "exact_target",
+    }
+
+    numeric_cols = [
+        col
+        for col in df.columns
+        if col not in excluded
+        and col != "discipline_combo"
+    ]
+
+    x_num = df[numeric_cols].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+
+    discipline = pd.get_dummies(
+        df["discipline_combo"].fillna("INCONNU"),
+        prefix="discipline",
+        dtype=float,
+    )
+
+    x = pd.concat(
+        [
+            x_num.reset_index(drop=True),
+            discipline.reset_index(drop=True),
+        ],
+        axis=1,
+    )
+
+    if feature_columns is None:
+        feature_columns = list(x.columns)
+    else:
+        for col in feature_columns:
+            if col not in x.columns:
+                x[col] = 0.0
+
+        x = x.reindex(
+            columns=feature_columns,
+            fill_value=0.0,
+        )
+
+    return x, feature_columns
+
+
+def combo_specs() -> list[dict]:
+    specs = []
+
+    for alpha in (0.1, 1.0, 10.0, 100.0):
+        specs.append(
+            {
+                "name": f"Ridge alpha={alpha}",
+                "kind": "ridge",
+                "alpha": alpha,
+            }
+        )
+
+    specs.extend(
+        [
+            {
+                "name": "RFreg depth=2 leaf=8",
+                "kind": "rfreg",
+                "max_depth": 2,
+                "min_samples_leaf": 8,
+            },
+            {
+                "name": "RFreg depth=3 leaf=6",
+                "kind": "rfreg",
+                "max_depth": 3,
+                "min_samples_leaf": 6,
+            },
+            {
+                "name": "RFreg depth=4 leaf=4",
+                "kind": "rfreg",
+                "max_depth": 4,
+                "min_samples_leaf": 4,
+            },
+            {
+                "name": "RFreg depth=6 leaf=2",
+                "kind": "rfreg",
+                "max_depth": 6,
+                "min_samples_leaf": 2,
+            },
+            {
+                "name": "ExtraReg depth=3 leaf=6",
+                "kind": "extrareg",
+                "max_depth": 3,
+                "min_samples_leaf": 6,
+            },
+            {
+                "name": "ExtraReg depth=5 leaf=4",
+                "kind": "extrareg",
+                "max_depth": 5,
+                "min_samples_leaf": 4,
+            },
+            {
+                "name": "ExtraReg depth=7 leaf=2",
+                "kind": "extrareg",
+                "max_depth": 7,
+                "min_samples_leaf": 2,
+            },
+            {
+                "name": "GBreg 100x0.03 depth1",
+                "kind": "gbreg",
+                "n_estimators": 100,
+                "learning_rate": 0.03,
+                "max_depth": 1,
+            },
+            {
+                "name": "GBreg 140x0.04 depth1",
+                "kind": "gbreg",
+                "n_estimators": 140,
+                "learning_rate": 0.04,
+                "max_depth": 1,
+            },
+            {
+                "name": "GBreg 140x0.03 depth2",
+                "kind": "gbreg",
+                "n_estimators": 140,
+                "learning_rate": 0.03,
+                "max_depth": 2,
+            },
+        ]
+    )
+
+    return specs
+
+
+def build_combo_model(
+    spec: dict,
+):
+    kind = spec["kind"]
+
+    if kind == "ridge":
+        return Pipeline(
+            [
+                (
+                    "imputer",
+                    SimpleImputer(strategy="median"),
+                ),
+                (
+                    "scaler",
+                    StandardScaler(),
+                ),
+                (
+                    "model",
+                    Ridge(
+                        alpha=float(spec["alpha"]),
+                    ),
+                ),
+            ]
+        )
+
+    if kind == "rfreg":
+        return Pipeline(
+            [
+                (
+                    "imputer",
+                    SimpleImputer(strategy="median"),
+                ),
+                (
+                    "model",
+                    RandomForestRegressor(
+                        n_estimators=300,
+                        max_depth=spec["max_depth"],
+                        min_samples_leaf=int(spec["min_samples_leaf"]),
+                        max_features="sqrt",
+                        random_state=SELECTOR_RANDOM_STATE,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        )
+
+    if kind == "extrareg":
+        return Pipeline(
+            [
+                (
+                    "imputer",
+                    SimpleImputer(strategy="median"),
+                ),
+                (
+                    "model",
+                    ExtraTreesRegressor(
+                        n_estimators=350,
+                        max_depth=spec["max_depth"],
+                        min_samples_leaf=int(spec["min_samples_leaf"]),
+                        max_features="sqrt",
+                        random_state=SELECTOR_RANDOM_STATE,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        )
+
+    if kind == "gbreg":
+        return Pipeline(
+            [
+                (
+                    "imputer",
+                    SimpleImputer(strategy="median"),
+                ),
+                (
+                    "model",
+                    GradientBoostingRegressor(
+                        n_estimators=int(spec["n_estimators"]),
+                        learning_rate=float(spec["learning_rate"]),
+                        max_depth=int(spec["max_depth"]),
+                        random_state=SELECTOR_RANDOM_STATE,
+                        loss="huber",
+                    ),
+                ),
+            ]
+        )
+
+    raise ValueError(
+        f"Combo model inconnu : {kind}"
+    )
+
+
+def combo_metrics(
+    data: pd.DataFrame,
+    scores: np.ndarray,
+) -> dict:
+    work = data[
+        [
+            "race_id_combo",
+            "selection_tuple",
+            "overlap_target",
+            "exact_target",
+        ]
+    ].copy()
+
+    work["combo_score"] = scores
+
+    exact = 0
+    three_plus = 0
+    total_hits = 0
+    detail_rows = []
+
+    for race_id, group in work.groupby(
+        "race_id_combo",
+        sort=False,
+    ):
+        group = group.sort_values(
+            [
+                "combo_score",
+                "overlap_target",
+            ],
+            ascending=[
+                False,
+                False,
+            ],
+        )
+
+        # ATTENTION : overlap_target ne sert PAS au choix.
+        # Il n'est présent qu'après le tri pour le diagnostic.
+        chosen = group.iloc[0]
+
+        hits = int(
+            chosen["overlap_target"]
+        )
+
+        exact += int(hits == 4)
+        three_plus += int(hits >= 3)
+        total_hits += hits
+
+        detail_rows.append(
+            {
+                "race_id": int(race_id),
+                "selected_hits": hits,
+                "exact_multi4": hits == 4,
+                "selection": "-".join(
+                    str(x)
+                    for x in chosen["selection_tuple"]
+                ),
+                "score": float(
+                    chosen["combo_score"]
+                ),
+            }
+        )
+
+    races = int(
+        work["race_id_combo"].nunique()
+    )
+
+    return {
+        "races": races,
+        "exact_hits": exact,
+        "three_plus": three_plus,
+        "total_target_hits": total_hits,
+        "avg_target_hits": (
+            total_hits / races
+            if races
+            else 0.0
+        ),
+        "detail": pd.DataFrame(
+            detail_rows
+        ),
+    }
+
+
+def train_combo_search(
+    cache: list[dict],
+) -> dict:
+    data = combo_dataset(
+        cache,
+        include_target=True,
+    )
+
+    if data.empty:
+        raise RuntimeError(
+            "Dataset ComboRanker vide."
+        )
+
+    x, feature_columns = combo_matrix(
+        data
+    )
+
+    y = data[
+        "overlap_target"
+    ].astype(float).to_numpy()
+
+    groups = data[
+        "race_id_combo"
+    ].astype(int).to_numpy()
+
+    unique_groups = np.unique(groups)
+    n_splits = min(
+        SELECTOR_FOLDS,
+        len(unique_groups),
+    )
+
+    splitter = GroupKFold(
+        n_splits=n_splits
+    )
+
+    specs = combo_specs()
+    board = []
+    best_key = None
+    best_bundle = None
+
+    progress = st.progress(
+        0.0,
+        text="V6 ComboRanker : recherche des modèles…",
+    )
+
+    for i, spec in enumerate(
+        specs,
+        start=1,
+    ):
+        oof_scores = np.full(
+            len(data),
+            np.nan,
+            dtype=float,
+        )
+
+        for train_idx, valid_idx in splitter.split(
+            x,
+            y,
+            groups,
+        ):
+            model = build_combo_model(
+                spec
+            )
+
+            model.fit(
+                x.iloc[train_idx],
+                y[train_idx],
+            )
+
+            oof_scores[valid_idx] = (
+                model.predict(
+                    x.iloc[valid_idx]
+                )
+            )
+
+        if np.isnan(oof_scores).any():
+            raise RuntimeError(
+                "Scores ComboRanker OOF incomplets."
+            )
+
+        oof = combo_metrics(
+            data,
+            oof_scores,
+        )
+
+        full_model = build_combo_model(
+            spec
+        )
+        full_model.fit(
+            x,
+            y,
+        )
+
+        train_scores = full_model.predict(
+            x
+        )
+        train = combo_metrics(
+            data,
+            train_scores,
+        )
+
+        row = {
+            "Modèle": spec["name"],
+            "Type": spec["kind"],
+            "OOF Multi4": oof["exact_hits"],
+            "OOF ≥3/4": oof["three_plus"],
+            "OOF chevaux trouvés": oof["total_target_hits"],
+            "OOF moy./4": round(
+                oof["avg_target_hits"],
+                4,
+            ),
+            "Train Multi4": train["exact_hits"],
+            "Train ≥3/4": train["three_plus"],
+            "Train chevaux trouvés": train["total_target_hits"],
+        }
+
+        board.append(row)
+
+        key = (
+            oof["exact_hits"],
+            oof["three_plus"],
+            oof["total_target_hits"],
+            train["exact_hits"],
+        )
+
+        if best_key is None or key > best_key:
+            best_key = key
+            best_bundle = {
+                "spec": dict(spec),
+                "model": full_model,
+                "oof_metrics": oof,
+                "train_metrics": train,
+            }
+
+        progress.progress(
+            i / len(specs),
+            text=(
+                f"V6 ComboRanker : "
+                f"{i}/{len(specs)} modèles"
+            ),
+        )
+
+    progress.empty()
+
+    leaderboard = (
+        pd.DataFrame(board)
+        .sort_values(
+            [
+                "OOF Multi4",
+                "OOF ≥3/4",
+                "OOF chevaux trouvés",
+                "Train Multi4",
+            ],
+            ascending=[
+                False,
+                False,
+                False,
+                False,
+            ],
+        )
+        .reset_index(drop=True)
+    )
+
+    return {
+        "dataset": data,
+        "feature_columns": feature_columns,
+        "leaderboard": leaderboard,
+        "best": best_bundle,
+    }
+
+
+def combo_live_rank(
+    item: dict,
+    model,
+    feature_columns: list[str],
+) -> tuple[list[int], pd.DataFrame]:
+    pool = candidate_pool(
+        item,
+        include_target=False,
+    )
+
+    if len(pool) < 4:
+        raise RuntimeError(
+            "Pool V6 inférieur à 4 chevaux."
+        )
+
+    import itertools
+
+    rows = []
+
+    for combo in itertools.combinations(
+        range(len(pool)),
+        4,
+    ):
+        rows.append(
+            quartet_feature_row(
+                item,
+                pool,
+                combo,
+                include_target=False,
+            )
+        )
+
+    combos = pd.DataFrame(rows)
+
+    x, _ = combo_matrix(
+        combos,
+        feature_columns=feature_columns,
+    )
+
+    combos["combo_score"] = model.predict(
+        x
+    )
+
+    combos = combos.sort_values(
+        "combo_score",
+        ascending=False,
+    ).reset_index(drop=True)
+
+    best = list(
+        combos.iloc[0]["selection_tuple"]
+    )
+
+    return best, combos
+
+
+
 # =============================================================================
 # CALIBRATION COHORT
 # =============================================================================
@@ -2450,7 +3231,7 @@ def _matches_expected(
 
 def run_calibration() -> dict:
     with st.spinner(
-        "Reconstruction de la cohorte exacte des 84 Multi…"
+        "Reconstruction des 84 courses exactes…"
     ):
         package = build_calibration_package()
 
@@ -2461,58 +3242,47 @@ def run_calibration() -> dict:
             "Aucune course exploitable."
         )
 
-    m8_win = evaluate_rank_column(
-        cache,
-        "m8_rank_win",
-    )
     m8_place = evaluate_rank_column(
         cache,
         "m8_rank_place",
     )
-    neural = evaluate_rank_column(
-        cache,
-        "neural_rank",
-    )
-    market = evaluate_rank_column(
-        cache,
-        "market_rank",
-    )
 
-    v4_metrics = evaluate_weights(
+    if not (
+        len(cache) == EXPECTED_COHORT
+        and _matches_expected(m8_place)
+    ):
+        raise RuntimeError(
+            "Sanity check refusé : la cohorte 84 ou "
+            "M8 place 5/15/23 n'est pas reproduite."
+        )
+
+    v4 = evaluate_weights(
         cache,
         V4_WEIGHTS,
     )
-
-    reference_ok = (
-        len(cache) == EXPECTED_COHORT
-        and _matches_expected(m8_place)
-    )
-
-    if not reference_ok:
-        raise RuntimeError(
-            "Sanity check V5 refusé : la cohorte 84 ou "
-            "la référence M8 place 5/15/23 n'est pas reproduite."
-        )
 
     oracle = oracle_pool_table(
         cache
     )
 
-    selector = train_selector_search(
+    # Baseline V5 pointwise.
+    selector_v5 = train_selector_search(
         cache
     )
 
-    best_oof = selector["best_oof"]
-    best_train = selector["best_train"]
+    # V6 : modèle combinatoire directement aligné sur le quartet.
+    combo_v6 = train_combo_search(
+        cache
+    )
 
     fingerprint_payload = {
         "version": APP_VERSION,
         "cohort": len(cache),
         "pool_k": SELECTOR_POOL_K,
-        "selector_spec": best_oof["spec"],
+        "v5_spec": selector_v5["best_oof"]["spec"],
+        "v6_spec": combo_v6["best"]["spec"],
         "model8_hash": MODEL8_HASH,
         "neural_hash": NEURAL_HASH,
-        "feature_columns": selector["feature_columns"],
     }
 
     fingerprint = hashlib.sha256(
@@ -2524,14 +3294,11 @@ def run_calibration() -> dict:
 
     return {
         **package,
-        "m8_win": m8_win,
         "m8_place": m8_place,
-        "neural": neural,
-        "market": market,
-        "v4_metrics": v4_metrics,
+        "v4_metrics": v4,
         "oracle": oracle,
-        "selector": selector,
-        "lock_ok": True,
+        "selector_v5": selector_v5,
+        "combo_v6": combo_v6,
         "fingerprint": fingerprint,
     }
 
@@ -2655,17 +3422,16 @@ def future_data(
 # =============================================================================
 
 with st.sidebar:
-    st.header("⚙️ Multi M9 V5 Selector")
+    st.header("⚙️ Multi M9 V6 ComboRanker")
     st.write(f"**Version :** `{APP_VERSION}`")
-    st.write("**Model #8 :** gelé")
-    st.write("**Neural #9 :** gelé")
-    st.write("**Pool :** Top6 M8 place + Neural + marché")
-    st.write("**Sortie :** exactement 4 chevaux")
-    st.write("**Cohorte calibration :** 84 courses")
+    st.write("**Cohorte :** 84 courses")
+    st.write("**Pool :** union Top6 M8 place + Neural + marché")
+    st.write("**Quartets :** toutes les combinaisons de 4")
+    st.write("**Choix forward :** meilleur modèle OOF groupé")
 
-    if "m9v5" in st.session_state:
-        cal = st.session_state["m9v5"]
-        st.success("✅ V5 calibré dans cette session")
+    if "m9v6" in st.session_state:
+        cal = st.session_state["m9v6"]
+        st.success("✅ V6 calibré")
         st.caption(
             "Empreinte : "
             + cal["fingerprint"][:14]
@@ -2675,7 +3441,7 @@ with st.sidebar:
 
 tab_cal, tab_live, tab_method = st.tabs(
     [
-        "🧠 Calibration V5 Selector",
+        "🧩 Calibration V6 ComboRanker",
         "🎯 Pronostics Multi",
         "📐 Méthode",
     ]
@@ -2683,124 +3449,113 @@ tab_cal, tab_live, tab_method = st.tabs(
 
 
 with tab_cal:
-    st.subheader("🧠 V5 : apprendre à choisir 4 chevaux dans le pool Top6")
+    st.subheader(
+        "🧩 V6 : noter directement chaque combinaison de 4 chevaux"
+    )
 
     st.warning(
-        "Les 84 courses sont des données de calibration/découverte. "
-        "Le score 'Train' peut être surajusté. "
-        "Pour choisir le modèle à utiliser sur les prochaines courses, "
-        "V5 privilégie le score OOF groupé par course."
+        "Le score OOF groupé par course est le critère principal. "
+        "Le score Train reste descriptif : il ne constitue pas une validation indépendante."
     )
 
     if st.button(
-        "🚀 Calibrer V5 Selector sur les 84 courses",
+        "🚀 Calibrer V6 ComboRanker sur les 84 courses",
         type="primary",
         use_container_width=True,
     ):
         try:
-            st.session_state["m9v5"] = (
+            st.session_state["m9v6"] = (
                 run_calibration()
             )
         except Exception as exc:
             st.exception(exc)
 
-    cal = st.session_state.get("m9v5")
+    cal = st.session_state.get("m9v6")
 
     if cal is not None:
-        selector = cal["selector"]
-        robust = selector["best_oof"]
-        historical = selector["best_train"]
+        v5 = cal["selector_v5"]["best_oof"]
+        v6 = cal["combo_v6"]["best"]
 
-        c1, c2, c3, c4 = st.columns(4)
+        a, b, c, d, e = st.columns(5)
 
-        c1.metric(
-            "Cohorte",
-            len(cal["cache"]),
-            delta="OK = 84",
-        )
-
-        c2.metric(
-            "M8 place Multi4",
+        a.metric(
+            "M8 place",
             f"{cal['m8_place']['hits4']}/84",
         )
-
-        c3.metric(
+        b.metric(
             "M9 V4",
             f"{cal['v4_metrics']['hits4']}/84",
-            delta=f"{cal['v4_metrics']['hits4'] - cal['m8_place']['hits4']:+d} vs M8",
         )
-
-        c4.metric(
+        c.metric(
+            "V5 OOF",
+            f"{v5['oof_metrics']['exact_hits']}/84",
+        )
+        d.metric(
+            "V6 OOF",
+            f"{v6['oof_metrics']['exact_hits']}/84",
+            delta=f"{v6['oof_metrics']['exact_hits'] - v5['oof_metrics']['exact_hits']:+d} vs V5",
+        )
+        e.metric(
             "Oracle Top6",
-            f"{robust['oof_metrics']['oracle_pool_hits']}/84",
-            delta="plafond du pool",
+            "39/84",
         )
 
         st.success(
-            "✅ Sanity check validé : M8 place = "
+            "✅ Sanity check : cohorte 84 et M8 place = "
             f"{cal['m8_place']['hits4']}/84, "
             f"{cal['m8_place']['hits5']}/84, "
             f"{cal['m8_place']['hits6']}/84."
         )
 
-        st.markdown("### 🎯 Résultat V5")
+        st.markdown("### 🏆 Modèle V6 retenu")
 
-        a, b, c, d = st.columns(4)
+        c1, c2, c3, c4 = st.columns(4)
 
-        a.metric(
-            "V5 robuste — OOF Multi4",
-            f"{robust['oof_metrics']['exact_hits']}/84",
-            delta=f"{robust['oof_metrics']['exact_hits'] - cal['m8_place']['hits4']:+d} vs M8",
+        c1.metric(
+            "OOF Multi4",
+            f"{v6['oof_metrics']['exact_hits']}/84",
         )
-
-        b.metric(
-            "V5 robuste — ≥3/4",
-            f"{robust['oof_metrics']['three_plus']}/84",
+        c2.metric(
+            "OOF ≥3/4",
+            f"{v6['oof_metrics']['three_plus']}/84",
         )
-
-        c.metric(
-            "Même modèle entraîné sur 84",
-            f"{robust['train_metrics']['exact_hits']}/84",
-            help="Score in-sample : utile pour le calibrage, pas pour une validation indépendante.",
+        c3.metric(
+            "OOF chevaux trouvés",
+            f"{v6['oof_metrics']['total_target_hits']}/336",
         )
-
-        d.metric(
-            "Historique max testé",
-            f"{historical['train_metrics']['exact_hits']}/84",
-            help="Meilleur score in-sample parmi les modèles testés. Diagnostic de capacité/overfit.",
+        c4.metric(
+            "Train Multi4",
+            f"{v6['train_metrics']['exact_hits']}/84",
         )
 
         st.write(
-            f"**Modèle choisi pour le forward :** `{robust['spec']['name']}`"
+            f"**ComboRanker choisi :** `{v6['spec']['name']}`"
         )
 
-        if historical["spec"]["name"] != robust["spec"]["name"]:
-            st.caption(
-                "Le modèle qui maximise purement l'historique est "
-                f"`{historical['spec']['name']}` "
-                f"({historical['train_metrics']['exact_hits']}/84 en train, "
-                f"{historical['oof_metrics']['exact_hits']}/84 en OOF). "
-                "Il n'est pas utilisé par défaut en forward."
-            )
-
-        st.markdown("### 🔭 Plafond oracle des pools")
-
+        st.markdown("### 🔭 Oracle du pool")
         st.dataframe(
             cal["oracle"],
             use_container_width=True,
             hide_index=True,
         )
 
-        st.markdown("### 🏆 Comparaison des modèles Selector")
-
+        st.markdown("### 🧩 Tous les modèles V6")
         st.dataframe(
-            selector["leaderboard"],
+            cal["combo_v6"]["leaderboard"],
             use_container_width=True,
             hide_index=True,
         )
 
-        with st.expander("🔎 Courses OOF du modèle retenu"):
-            detail = robust["oof_metrics"]["detail"].copy()
+        with st.expander("📊 Baseline V5 pointwise"):
+            st.dataframe(
+                cal["selector_v5"]["leaderboard"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with st.expander("🔎 Détail course par course — V6 OOF"):
+            detail = v6["oof_metrics"]["detail"].copy()
+
             audit = cal["audit"][
                 cal["audit"]["usable_84"] == True
             ][
@@ -2826,70 +3581,27 @@ with tab_cal:
                 hide_index=True,
             )
 
-        with st.expander("🔎 Dataset candidats V5"):
-            show_cols = [
-                "race_id_selector",
-                "horse_number",
-                "horse_name",
-                "m8_rank_place",
-                "neural_rank",
-                "market_rank",
-                "votes_top4",
-                "votes_top6",
-                "pool_size",
-                "is_target",
-            ]
-
-            st.dataframe(
-                selector["dataset"][show_cols],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        config = {
-            "app": APP_NAME,
-            "version": APP_VERSION,
-            "cohort_size": len(cal["cache"]),
-            "pool_k": SELECTOR_POOL_K,
-            "selector_for_forward": robust["spec"],
-            "oof_metrics": {
-                key: value
-                for key, value in robust["oof_metrics"].items()
-                if key != "detail"
-            },
-            "train_metrics": {
-                key: value
-                for key, value in robust["train_metrics"].items()
-                if key != "detail"
-            },
-            "historical_max_spec": historical["spec"],
-            "historical_max_train_multi4": historical["train_metrics"]["exact_hits"],
-            "model8_hash": MODEL8_HASH,
-            "neural_hash": NEURAL_HASH,
-            "fingerprint": cal["fingerprint"],
-        }
-
         st.download_button(
-            "⬇️ Télécharger la configuration V5 Selector",
-            data=json.dumps(
-                config,
-                ensure_ascii=False,
-                indent=2,
+            "⬇️ Télécharger les résultats V6 OOF",
+            data=v6["oof_metrics"]["detail"].to_csv(
+                index=False
             ),
-            file_name="horseprono_multi_m9_v5_selector_config.json",
-            mime="application/json",
+            file_name="m9_v6_comboranker_oof.csv",
+            mime="text/csv",
             use_container_width=True,
         )
 
 
 with tab_live:
-    st.subheader("🎯 Pronostics Multi — V5 Selector")
+    st.subheader(
+        "🎯 Pronostics Multi — V6 ComboRanker"
+    )
 
-    cal = st.session_state.get("m9v5")
+    cal = st.session_state.get("m9v6")
 
     if cal is None:
         st.info(
-            "Lance d'abord la calibration V5 dans le premier onglet."
+            "Calibre d'abord V6 dans le premier onglet."
         )
     else:
         selected_day = st.date_input(
@@ -2898,7 +3610,7 @@ with tab_live:
         )
 
         if st.button(
-            "🔎 Analyser les Multi de cette date avec V5",
+            "🔎 Analyser les Multi avec V6",
             type="primary",
             use_container_width=True,
         ):
@@ -2912,13 +3624,16 @@ with tab_live:
                         "Aucune course E_MULTI / E_MINI_MULTI détectée."
                     )
                 else:
-                    robust = cal["selector"]["best_oof"]
-                    model = robust["model"]
-                    feature_columns = cal["selector"]["feature_columns"]
+                    bundle = cal["combo_v6"]["best"]
+                    model = bundle["model"]
+                    feature_columns = (
+                        cal["combo_v6"]["feature_columns"]
+                    )
 
                     for _, row in live["mapped"].iterrows():
                         reunion = int(row["meeting_number"])
                         course = int(row["race_number"])
+
                         hippodrome = (
                             row.get("hippodrome")
                             or row.get("hippodrome_pmu")
@@ -2967,65 +3682,46 @@ with tab_live:
                             "multi_codes": row.get("multi_codes"),
                         }
 
-                        ranked = selector_live_rank(
+                        best, combos = combo_live_rank(
                             item,
                             model,
                             feature_columns,
                         )
 
-                        top4 = (
-                            ranked.head(4)["horse_number"]
-                            .astype(int)
-                            .tolist()
-                        )
-
                         st.metric(
-                            "🎯 Multi4 V5 Selector",
-                            " - ".join(map(str, top4)),
+                            "🎯 Multi4 V6",
+                            " - ".join(
+                                map(str, best)
+                            ),
                         )
 
                         st.caption(
-                            f"Pool Top6 union : {len(ranked)} chevaux · "
-                            f"modèle forward : {robust['spec']['name']}"
+                            f"{len(combos)} quartets évalués · "
+                            f"modèle : {bundle['spec']['name']}"
                         )
 
-                        display = ranked[
-                            [
-                                "selector_rank",
-                                "horse_number",
-                                "horse_name",
-                                "selector_probability",
-                                "m8_rank_place",
-                                "neural_rank",
-                                "market_rank",
-                                "votes_top4",
-                                "votes_top6",
-                                "odds",
-                            ]
-                        ].copy()
-
-                        display["selector_probability"] = (
-                            display["selector_probability"]
-                            .round(4)
-                        )
-
-                        display = display.rename(
-                            columns={
-                                "selector_rank": "Rang V5",
-                                "horse_number": "N°",
-                                "horse_name": "Cheval",
-                                "selector_probability": "Score V5",
-                                "m8_rank_place": "M8 placé",
-                                "neural_rank": "Neural",
-                                "market_rank": "Marché",
-                                "votes_top4": "Votes Top4",
-                                "votes_top6": "Votes Top6",
-                                "odds": "Cote",
-                            }
+                        show = combos.head(10).copy()
+                        show["selection"] = show[
+                            "selection_tuple"
+                        ].apply(
+                            lambda x: "-".join(
+                                str(n)
+                                for n in x
+                            )
                         )
 
                         st.dataframe(
-                            display,
+                            show[
+                                [
+                                    "selection",
+                                    "combo_score",
+                                ]
+                            ].rename(
+                                columns={
+                                    "selection": "Quartet",
+                                    "combo_score": "Score V6",
+                                }
+                            ),
                             use_container_width=True,
                             hide_index=True,
                         )
@@ -3037,34 +3733,34 @@ with tab_live:
 
 
 with tab_method:
-    st.subheader("📐 Logique de V5 Selector")
+    st.subheader("📐 Pourquoi V6 ?")
 
     st.markdown(
         """
-V5 ne fait plus une moyenne linéaire de M8, Neural et marché.
+V5 notait chaque cheval séparément puis prenait les quatre meilleurs.
+C'est utile, mais ce n'est pas exactement notre objectif.
 
-Pour chaque course :
+V6 travaille directement au niveau du **quartet** :
 
-1. il construit le **pool union des Top6** M8 placé + Neural + marché ;
-2. ce pool contient en moyenne environ **7 chevaux** ;
-3. chaque candidat reçoit des variables de consensus et de divergence :
-   rangs, probabilités, cotes, écarts de rang, votes Top3/4/5/6,
-   appartenance exclusive à un modèle, discipline et taille du peloton ;
-4. plusieurs sélecteurs supervisés sont testés ;
-5. chaque sélecteur doit sortir **exactement 4 chevaux**.
+1. pool = union des **Top6 M8 placé + Neural + marché** ;
+2. toutes les combinaisons possibles de **4 chevaux** sont générées ;
+3. chaque quartet reçoit des caractéristiques collectives :
+   consensus, sommes/moyennes de rangs, probabilités, écarts entre modèles,
+   nombre de chevaux soutenus par 2 ou 3 sources, cotes et contexte de course ;
+4. un modèle prédit le **nombre attendu de chevaux de l'arrivée Top4**
+   présents dans ce quartet ;
+5. on sélectionne le quartet au score maximal.
 
-Le choix du modèle forward est fait sur une **validation OOF groupée par course** :
-une course n'est jamais utilisée pour entraîner le modèle qui la prédit dans
-son score OOF.
+L'entraînement et l'évaluation OOF sont séparés par **course entière**.
+Ainsi aucune combinaison d'une course de validation n'apparaît dans
+l'entraînement du fold qui la prédit.
 
-Le score 'Train' est également affiché parce que notre objectif de calibration
-est d'étudier combien des 39/84 Multi théoriquement présents dans le pool Top6
-peuvent être récupérés. Mais ce score est volontairement séparé du score OOF
-pour éviter de confondre surapprentissage et capacité de généralisation.
+Le but est d'améliorer surtout les nombreuses courses où V5 trouvait déjà
+**3 chevaux sur 4**, en choisissant mieux le quatrième divergent.
         """
     )
 
     st.info(
-        "Après sélection du V5, les 84 courses restent figées. "
-        "Les courses suivantes constituent le vrai test forward."
+        "Les 84 courses restent un jeu de calibration. "
+        "Le modèle choisi devra ensuite être figé pour le forward."
     )

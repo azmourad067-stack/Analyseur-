@@ -12,9 +12,20 @@ import requests
 import streamlit as st
 from supabase import create_client
 
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    GradientBoostingClassifier,
+    RandomForestClassifier,
+)
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GroupKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
 
 # =============================================================================
-# HORSEPRONO MULTI M9 — V2
+# HORSEPRONO MULTI M9 — V5 SELECTOR
 #
 # Correction principale :
 #   - la cohorte de calibration n'est PLUS définie par "tout texte contenant MULTI"
@@ -27,7 +38,7 @@ from supabase import create_client
 # =============================================================================
 
 APP_NAME = "HorseProno Multi M9"
-APP_VERSION = "M9-MULTI-V4"
+APP_VERSION = "M9-MULTI-V5-SELECTOR"
 
 PMU_BASE_URL = "https://online.turfinfo.api.pmu.fr/rest/client/1"
 REQUEST_TIMEOUT = 25
@@ -68,6 +79,15 @@ SIGNAL_NAMES = [
 ]
 
 
+# V4 figée uniquement comme baseline historique.
+V4_WEIGHTS = np.array([0.00, 0.60, 0.05, 0.35, 0.00], dtype=float)
+
+# V5 : union des Top6 M8 placé + Neural + marché.
+SELECTOR_POOL_K = 6
+SELECTOR_FOLDS = 6
+SELECTOR_RANDOM_STATE = 42
+
+
 # =============================================================================
 # STREAMLIT
 # =============================================================================
@@ -78,10 +98,9 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🏇 HorseProno Multi M9 — V4")
+st.title("🏇 HorseProno Multi M9 — V5 Selector")
 st.caption(
-    "Méta-modèle spécialisé Multi. V4 reconstruit la cohorte historique exacte de 84 "
-    "courses avant toute optimisation."
+    "V5 Selector : pool Top6 M8 placé + Neural + marché, puis sélection intelligente de 4 chevaux."
 )
 
 
@@ -1363,6 +1382,854 @@ def optimize(
     )
 
 
+
+# =============================================================================
+# V5 SELECTOR — POOL TOP6 -> 4 CHEVAUX
+# =============================================================================
+
+SELECTOR_NUMERIC_FEATURES = [
+    "m8_rank_place",
+    "neural_rank",
+    "market_rank",
+    "m8_rank_win",
+    "sig_m8_place",
+    "sig_neural_top3",
+    "sig_market",
+    "sig_m8_win",
+    "m8_place_probability",
+    "neural_top3_probability",
+    "market_probability",
+    "m8_win_probability",
+    "best_rank",
+    "mean_rank",
+    "worst_rank",
+    "rank_std",
+    "rank_range",
+    "gap_m8_neural",
+    "gap_m8_market",
+    "gap_neural_market",
+    "votes_top3",
+    "votes_top4",
+    "votes_top5",
+    "votes_top6",
+    "only_m8_top6",
+    "only_neural_top6",
+    "only_market_top6",
+    "m8_and_neural_top6",
+    "m8_and_market_top6",
+    "neural_and_market_top6",
+    "all3_top6",
+    "odds",
+    "log_odds",
+    "field_size",
+    "pool_size",
+    "is_e_multi",
+    "is_mini_multi",
+]
+
+
+def candidate_pool(
+    item: dict,
+    include_target: bool,
+    top_k: int = SELECTOR_POOL_K,
+) -> pd.DataFrame:
+    """
+    Construit le pool des chevaux apparaissant dans au moins un TopK :
+    M8 placé, Neural, marché.
+    """
+    frame = engineer_features(
+        item["frame"]
+    ).copy()
+
+    mask = (
+        (pd.to_numeric(frame["m8_rank_place"], errors="coerce") <= top_k)
+        | (pd.to_numeric(frame["neural_rank"], errors="coerce") <= top_k)
+        | (pd.to_numeric(frame["market_rank"], errors="coerce") <= top_k)
+    )
+
+    pool = frame[mask].copy().reset_index(drop=True)
+
+    if pool.empty:
+        return pool
+
+    ranks = pool[
+        ["m8_rank_place", "neural_rank", "market_rank"]
+    ].apply(pd.to_numeric, errors="coerce")
+
+    pool["best_rank"] = ranks.min(axis=1)
+    pool["mean_rank"] = ranks.mean(axis=1)
+    pool["worst_rank"] = ranks.max(axis=1)
+    pool["rank_std"] = ranks.std(axis=1).fillna(0.0)
+    pool["rank_range"] = pool["worst_rank"] - pool["best_rank"]
+
+    pool["gap_m8_neural"] = (
+        ranks["m8_rank_place"] - ranks["neural_rank"]
+    ).abs()
+    pool["gap_m8_market"] = (
+        ranks["m8_rank_place"] - ranks["market_rank"]
+    ).abs()
+    pool["gap_neural_market"] = (
+        ranks["neural_rank"] - ranks["market_rank"]
+    ).abs()
+
+    for k in (3, 4, 5, 6):
+        pool[f"votes_top{k}"] = (
+            (ranks["m8_rank_place"] <= k).astype(int)
+            + (ranks["neural_rank"] <= k).astype(int)
+            + (ranks["market_rank"] <= k).astype(int)
+        )
+
+    m8_top6 = ranks["m8_rank_place"] <= 6
+    n_top6 = ranks["neural_rank"] <= 6
+    market_top6 = ranks["market_rank"] <= 6
+
+    pool["only_m8_top6"] = (
+        m8_top6 & ~n_top6 & ~market_top6
+    ).astype(int)
+    pool["only_neural_top6"] = (
+        ~m8_top6 & n_top6 & ~market_top6
+    ).astype(int)
+    pool["only_market_top6"] = (
+        ~m8_top6 & ~n_top6 & market_top6
+    ).astype(int)
+
+    pool["m8_and_neural_top6"] = (
+        m8_top6 & n_top6
+    ).astype(int)
+    pool["m8_and_market_top6"] = (
+        m8_top6 & market_top6
+    ).astype(int)
+    pool["neural_and_market_top6"] = (
+        n_top6 & market_top6
+    ).astype(int)
+    pool["all3_top6"] = (
+        m8_top6 & n_top6 & market_top6
+    ).astype(int)
+
+    pool["odds"] = pd.to_numeric(
+        pool["odds"],
+        errors="coerce",
+    )
+    pool["log_odds"] = np.log1p(
+        pool["odds"].clip(lower=0)
+    )
+
+    pool["field_size"] = float(
+        _safe_int(item.get("field_size"))
+        or len(frame)
+    )
+    pool["pool_size"] = float(len(pool))
+
+    multi_codes = str(
+        item.get("multi_codes") or ""
+    ).upper()
+
+    pool["is_e_multi"] = int(
+        "E_MULTI" in multi_codes
+        and "E_MINI_MULTI" not in multi_codes
+    )
+    pool["is_mini_multi"] = int(
+        "E_MINI_MULTI" in multi_codes
+    )
+
+    pool["discipline_selector"] = str(
+        item.get("discipline") or "INCONNU"
+    ).upper()
+
+    pool["race_id_selector"] = int(
+        item.get("race_id") or -1
+    )
+
+    pool["horse_name"] = (
+        pool["horse_name_m8"]
+        .fillna(pool["horse_name_neural"])
+    )
+
+    if include_target:
+        target = item.get("target") or frozenset()
+        pool["is_target"] = (
+            pool["horse_number"]
+            .astype(int)
+            .isin(set(target))
+            .astype(int)
+        )
+
+    return pool
+
+
+def selector_dataset(
+    cache: list[dict],
+) -> pd.DataFrame:
+    parts: list[pd.DataFrame] = []
+
+    for item in cache:
+        pool = candidate_pool(
+            item,
+            include_target=True,
+        )
+
+        if pool.empty:
+            continue
+
+        parts.append(pool)
+
+    if not parts:
+        return pd.DataFrame()
+
+    return pd.concat(
+        parts,
+        ignore_index=True,
+    )
+
+
+def selector_matrix(
+    df: pd.DataFrame,
+    feature_columns: list[str] | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    numeric = df.copy()
+
+    for column in SELECTOR_NUMERIC_FEATURES:
+        if column not in numeric.columns:
+            numeric[column] = np.nan
+
+    x_num = numeric[
+        SELECTOR_NUMERIC_FEATURES
+    ].apply(pd.to_numeric, errors="coerce")
+
+    discipline = pd.get_dummies(
+        numeric["discipline_selector"].fillna("INCONNU"),
+        prefix="discipline",
+        dtype=float,
+    )
+
+    x = pd.concat(
+        [
+            x_num.reset_index(drop=True),
+            discipline.reset_index(drop=True),
+        ],
+        axis=1,
+    )
+
+    if feature_columns is None:
+        feature_columns = list(x.columns)
+    else:
+        for column in feature_columns:
+            if column not in x.columns:
+                x[column] = 0.0
+
+        x = x.reindex(
+            columns=feature_columns,
+            fill_value=0.0,
+        )
+
+    return x, feature_columns
+
+
+def selector_specs() -> list[dict]:
+    specs: list[dict] = []
+
+    for c in (0.03, 0.10, 0.30, 1.0, 3.0, 10.0):
+        specs.append(
+            {
+                "name": f"Logistic C={c}",
+                "kind": "logistic",
+                "C": c,
+            }
+        )
+
+    specs.extend(
+        [
+            {
+                "name": "RF depth=2 leaf=6",
+                "kind": "rf",
+                "max_depth": 2,
+                "min_samples_leaf": 6,
+            },
+            {
+                "name": "RF depth=3 leaf=5",
+                "kind": "rf",
+                "max_depth": 3,
+                "min_samples_leaf": 5,
+            },
+            {
+                "name": "RF depth=4 leaf=3",
+                "kind": "rf",
+                "max_depth": 4,
+                "min_samples_leaf": 3,
+            },
+            {
+                "name": "RF depth=6 leaf=2",
+                "kind": "rf",
+                "max_depth": 6,
+                "min_samples_leaf": 2,
+            },
+            {
+                "name": "RF full leaf=1",
+                "kind": "rf",
+                "max_depth": None,
+                "min_samples_leaf": 1,
+            },
+            {
+                "name": "ExtraTrees depth=3 leaf=5",
+                "kind": "extra",
+                "max_depth": 3,
+                "min_samples_leaf": 5,
+            },
+            {
+                "name": "ExtraTrees depth=5 leaf=3",
+                "kind": "extra",
+                "max_depth": 5,
+                "min_samples_leaf": 3,
+            },
+            {
+                "name": "ExtraTrees depth=7 leaf=2",
+                "kind": "extra",
+                "max_depth": 7,
+                "min_samples_leaf": 2,
+            },
+            {
+                "name": "ExtraTrees full leaf=2",
+                "kind": "extra",
+                "max_depth": None,
+                "min_samples_leaf": 2,
+            },
+            {
+                "name": "ExtraTrees full leaf=1",
+                "kind": "extra",
+                "max_depth": None,
+                "min_samples_leaf": 1,
+            },
+            {
+                "name": "GB 80x0.03 depth1",
+                "kind": "gb",
+                "n_estimators": 80,
+                "learning_rate": 0.03,
+                "max_depth": 1,
+            },
+            {
+                "name": "GB 120x0.05 depth1",
+                "kind": "gb",
+                "n_estimators": 120,
+                "learning_rate": 0.05,
+                "max_depth": 1,
+            },
+            {
+                "name": "GB 120x0.05 depth2",
+                "kind": "gb",
+                "n_estimators": 120,
+                "learning_rate": 0.05,
+                "max_depth": 2,
+            },
+            {
+                "name": "GB 160x0.03 depth2",
+                "kind": "gb",
+                "n_estimators": 160,
+                "learning_rate": 0.03,
+                "max_depth": 2,
+            },
+        ]
+    )
+
+    return specs
+
+
+def build_selector_model(
+    spec: dict,
+):
+    kind = spec["kind"]
+
+    if kind == "logistic":
+        return Pipeline(
+            [
+                (
+                    "imputer",
+                    SimpleImputer(strategy="median"),
+                ),
+                (
+                    "scaler",
+                    StandardScaler(),
+                ),
+                (
+                    "model",
+                    LogisticRegression(
+                        C=float(spec["C"]),
+                        max_iter=2500,
+                        random_state=SELECTOR_RANDOM_STATE,
+                    ),
+                ),
+            ]
+        )
+
+    if kind == "rf":
+        return Pipeline(
+            [
+                (
+                    "imputer",
+                    SimpleImputer(strategy="median"),
+                ),
+                (
+                    "model",
+                    RandomForestClassifier(
+                        n_estimators=300,
+                        max_depth=spec["max_depth"],
+                        min_samples_leaf=int(spec["min_samples_leaf"]),
+                        max_features="sqrt",
+                        random_state=SELECTOR_RANDOM_STATE,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        )
+
+    if kind == "extra":
+        return Pipeline(
+            [
+                (
+                    "imputer",
+                    SimpleImputer(strategy="median"),
+                ),
+                (
+                    "model",
+                    ExtraTreesClassifier(
+                        n_estimators=350,
+                        max_depth=spec["max_depth"],
+                        min_samples_leaf=int(spec["min_samples_leaf"]),
+                        max_features="sqrt",
+                        random_state=SELECTOR_RANDOM_STATE,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        )
+
+    if kind == "gb":
+        return Pipeline(
+            [
+                (
+                    "imputer",
+                    SimpleImputer(strategy="median"),
+                ),
+                (
+                    "model",
+                    GradientBoostingClassifier(
+                        n_estimators=int(spec["n_estimators"]),
+                        learning_rate=float(spec["learning_rate"]),
+                        max_depth=int(spec["max_depth"]),
+                        random_state=SELECTOR_RANDOM_STATE,
+                    ),
+                ),
+            ]
+        )
+
+    raise ValueError(
+        f"Type de modèle inconnu : {kind}"
+    )
+
+
+def positive_probability(
+    model,
+    x: pd.DataFrame,
+) -> np.ndarray:
+    proba = model.predict_proba(x)
+
+    if proba.shape[1] == 1:
+        # Cas théorique d'une classe unique.
+        return np.zeros(len(x), dtype=float)
+
+    classes = list(
+        getattr(model, "classes_", [0, 1])
+    )
+
+    if hasattr(model, "named_steps"):
+        classes = list(
+            model.named_steps["model"].classes_
+        )
+
+    positive_index = (
+        classes.index(1)
+        if 1 in classes
+        else -1
+    )
+
+    return proba[:, positive_index]
+
+
+def selector_metrics(
+    meta: pd.DataFrame,
+    scores: np.ndarray,
+) -> dict:
+    data = meta[
+        [
+            "race_id_selector",
+            "horse_number",
+            "m8_rank_place",
+            "is_target",
+        ]
+    ].copy()
+
+    data["score"] = scores
+
+    exact = 0
+    three_plus = 0
+    total_target_hits = 0
+    oracle_pool = 0
+    races = 0
+
+    detail_rows: list[dict] = []
+
+    for race_id, group in data.groupby(
+        "race_id_selector",
+        sort=False,
+    ):
+        races += 1
+
+        group = group.sort_values(
+            ["score", "m8_rank_place", "horse_number"],
+            ascending=[False, True, True],
+        )
+
+        selected = group.head(4)
+        selected_hits = int(
+            selected["is_target"].sum()
+        )
+        target_in_pool = int(
+            group["is_target"].sum()
+        )
+
+        total_target_hits += selected_hits
+        three_plus += int(
+            selected_hits >= 3
+        )
+        exact += int(
+            selected_hits == 4
+        )
+        oracle_pool += int(
+            target_in_pool == 4
+        )
+
+        detail_rows.append(
+            {
+                "race_id": int(race_id),
+                "selected_hits": selected_hits,
+                "target_in_pool": target_in_pool,
+                "exact_multi4": selected_hits == 4,
+                "selection": "-".join(
+                    str(int(x))
+                    for x in selected["horse_number"].tolist()
+                ),
+            }
+        )
+
+    return {
+        "races": races,
+        "exact_hits": exact,
+        "three_plus": three_plus,
+        "total_target_hits": total_target_hits,
+        "avg_target_hits": (
+            total_target_hits / races
+            if races
+            else 0.0
+        ),
+        "oracle_pool_hits": oracle_pool,
+        "detail": pd.DataFrame(detail_rows),
+    }
+
+
+def oracle_pool_table(
+    cache: list[dict],
+) -> pd.DataFrame:
+    rows = []
+
+    for k in (4, 5, 6, 7):
+        hits = 0
+        sizes = []
+
+        for item in cache:
+            frame = engineer_features(
+                item["frame"]
+            )
+
+            mask = (
+                (frame["m8_rank_place"] <= k)
+                | (frame["neural_rank"] <= k)
+                | (frame["market_rank"] <= k)
+            )
+
+            numbers = set(
+                frame.loc[
+                    mask,
+                    "horse_number",
+                ].astype(int)
+            )
+
+            sizes.append(
+                len(numbers)
+            )
+
+            if set(item["target"]).issubset(
+                numbers
+            ):
+                hits += 1
+
+        rows.append(
+            {
+                "Pool": f"Union Top{k}",
+                "Oracle Multi4": hits,
+                "Sur 84": f"{hits}/{len(cache)}",
+                "Taille moyenne pool": round(
+                    float(np.mean(sizes)),
+                    2,
+                ),
+                "Taille max": int(max(sizes)),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def train_selector_search(
+    cache: list[dict],
+) -> dict:
+    data = selector_dataset(
+        cache
+    )
+
+    if data.empty:
+        raise RuntimeError(
+            "Dataset Selector vide."
+        )
+
+    x, feature_columns = selector_matrix(
+        data
+    )
+
+    y = data["is_target"].astype(int).to_numpy()
+    groups = data[
+        "race_id_selector"
+    ].astype(int).to_numpy()
+
+    unique_groups = np.unique(groups)
+    n_splits = min(
+        SELECTOR_FOLDS,
+        len(unique_groups),
+    )
+
+    if n_splits < 2:
+        raise RuntimeError(
+            "Pas assez de courses pour la validation groupée."
+        )
+
+    splitter = GroupKFold(
+        n_splits=n_splits
+    )
+
+    specs = selector_specs()
+    progress = st.progress(
+        0.0,
+        text="V5 Selector : recherche des modèles…",
+    )
+
+    board: list[dict] = []
+    best_oof_key = None
+    best_oof_bundle = None
+    best_train_key = None
+    best_train_bundle = None
+
+    for i, spec in enumerate(
+        specs,
+        start=1,
+    ):
+        oof_scores = np.full(
+            len(data),
+            np.nan,
+            dtype=float,
+        )
+
+        for train_idx, valid_idx in splitter.split(
+            x,
+            y,
+            groups,
+        ):
+            model = build_selector_model(
+                spec
+            )
+            model.fit(
+                x.iloc[train_idx],
+                y[train_idx],
+            )
+            oof_scores[valid_idx] = (
+                positive_probability(
+                    model,
+                    x.iloc[valid_idx],
+                )
+            )
+
+        if np.isnan(oof_scores).any():
+            raise RuntimeError(
+                "Scores OOF incomplets."
+            )
+
+        oof_metrics = selector_metrics(
+            data,
+            oof_scores,
+        )
+
+        full_model = build_selector_model(
+            spec
+        )
+        full_model.fit(
+            x,
+            y,
+        )
+
+        train_scores = positive_probability(
+            full_model,
+            x,
+        )
+
+        train_metrics = selector_metrics(
+            data,
+            train_scores,
+        )
+
+        row = {
+            "Modèle": spec["name"],
+            "Type": spec["kind"],
+            "OOF Multi4": oof_metrics["exact_hits"],
+            "OOF ≥3/4": oof_metrics["three_plus"],
+            "OOF chevaux trouvés": oof_metrics["total_target_hits"],
+            "OOF moy./4": round(
+                oof_metrics["avg_target_hits"],
+                4,
+            ),
+            "Train Multi4": train_metrics["exact_hits"],
+            "Train ≥3/4": train_metrics["three_plus"],
+            "Train chevaux trouvés": train_metrics["total_target_hits"],
+            "Oracle pool": oof_metrics["oracle_pool_hits"],
+        }
+        board.append(row)
+
+        # Pour le futur : priorité à l'OOF groupé.
+        oof_key = (
+            oof_metrics["exact_hits"],
+            oof_metrics["three_plus"],
+            oof_metrics["total_target_hits"],
+            train_metrics["exact_hits"],
+        )
+
+        if best_oof_key is None or oof_key > best_oof_key:
+            best_oof_key = oof_key
+            best_oof_bundle = {
+                "spec": dict(spec),
+                "model": full_model,
+                "oof_scores": oof_scores.copy(),
+                "oof_metrics": oof_metrics,
+                "train_metrics": train_metrics,
+            }
+
+        # Pure maximisation historique : affichée mais jamais présentée
+        # comme validation indépendante.
+        train_key = (
+            train_metrics["exact_hits"],
+            train_metrics["three_plus"],
+            train_metrics["total_target_hits"],
+            oof_metrics["exact_hits"],
+        )
+
+        if best_train_key is None or train_key > best_train_key:
+            best_train_key = train_key
+            best_train_bundle = {
+                "spec": dict(spec),
+                "model": full_model,
+                "oof_metrics": oof_metrics,
+                "train_metrics": train_metrics,
+            }
+
+        progress.progress(
+            i / len(specs),
+            text=(
+                f"V5 Selector : {i}/{len(specs)} modèles testés"
+            ),
+        )
+
+    progress.empty()
+
+    leaderboard = (
+        pd.DataFrame(board)
+        .sort_values(
+            [
+                "OOF Multi4",
+                "OOF ≥3/4",
+                "OOF chevaux trouvés",
+                "Train Multi4",
+            ],
+            ascending=[
+                False,
+                False,
+                False,
+                False,
+            ],
+        )
+        .reset_index(drop=True)
+    )
+
+    return {
+        "dataset": data,
+        "feature_columns": feature_columns,
+        "leaderboard": leaderboard,
+        "best_oof": best_oof_bundle,
+        "best_train": best_train_bundle,
+    }
+
+
+def selector_live_rank(
+    item: dict,
+    model,
+    feature_columns: list[str],
+) -> pd.DataFrame:
+    pool = candidate_pool(
+        item,
+        include_target=False,
+    )
+
+    if len(pool) < 4:
+        raise RuntimeError(
+            "Pool Selector inférieur à 4 chevaux."
+        )
+
+    x, _ = selector_matrix(
+        pool,
+        feature_columns=feature_columns,
+    )
+
+    pool["selector_probability"] = (
+        positive_probability(
+            model,
+            x,
+        )
+    )
+
+    pool = pool.sort_values(
+        [
+            "selector_probability",
+            "m8_rank_place",
+            "horse_number",
+        ],
+        ascending=[
+            False,
+            True,
+            True,
+        ],
+    ).reset_index(drop=True)
+
+    pool["selector_rank"] = (
+        np.arange(1, len(pool) + 1)
+    )
+
+    return pool
+
+
+
 # =============================================================================
 # CALIBRATION COHORT
 # =============================================================================
@@ -1538,6 +2405,18 @@ def build_calibration_package() -> dict:
                 ),
                 "label_pmu": row.get("label_pmu"),
                 "multi_codes": row.get("multi_codes"),
+                "discipline": (
+                    row.get("discipline")
+                    or (
+                        str(frame["discipline"].iloc[0])
+                        if "discipline" in frame.columns and len(frame)
+                        else "INCONNU"
+                    )
+                ),
+                "field_size": (
+                    _safe_int(row.get("field_size"))
+                    or len(frame)
+                ),
                 "target": pmu_target,
                 "frame": frame,
                 "matrix": feature_matrix(frame),
@@ -1571,7 +2450,7 @@ def _matches_expected(
 
 def run_calibration() -> dict:
     with st.spinner(
-        "Reconstruction de la cohorte exacte via les rapports définitifs PMU…"
+        "Reconstruction de la cohorte exacte des 84 Multi…"
     ):
         package = build_calibration_package()
 
@@ -1586,54 +2465,54 @@ def run_calibration() -> dict:
         cache,
         "m8_rank_win",
     )
-
     m8_place = evaluate_rank_column(
         cache,
         "m8_rank_place",
     )
-
     neural = evaluate_rank_column(
         cache,
         "neural_rank",
     )
+    market = evaluate_rank_column(
+        cache,
+        "market_rank",
+    )
 
-    # Référence historique : on ne devine pas le tri.
-    # On choisit uniquement celui qui reproduit EXACTEMENT 5/15/23.
-    if _matches_expected(m8_win):
-        reference_column = "m8_rank_win"
-        reference_name = "M8 win"
-        reference_metrics = m8_win
+    v4_metrics = evaluate_weights(
+        cache,
+        V4_WEIGHTS,
+    )
 
-    elif _matches_expected(m8_place):
-        reference_column = "m8_rank_place"
-        reference_name = "M8 place"
-        reference_metrics = m8_place
+    reference_ok = (
+        len(cache) == EXPECTED_COHORT
+        and _matches_expected(m8_place)
+    )
 
-    else:
-        reference_column = None
-        reference_name = "NON REPRODUITE"
-        reference_metrics = None
+    if not reference_ok:
+        raise RuntimeError(
+            "Sanity check V5 refusé : la cohorte 84 ou "
+            "la référence M8 place 5/15/23 n'est pas reproduite."
+        )
 
-    weights, optimized, leaderboard = optimize(
+    oracle = oracle_pool_table(
         cache
     )
 
-    lock_ok = (
-        len(package["historical_complete"]) == EXPECTED_COHORT
-        and len(cache) == EXPECTED_COHORT
-        and reference_column is not None
+    selector = train_selector_search(
+        cache
     )
+
+    best_oof = selector["best_oof"]
+    best_train = selector["best_train"]
 
     fingerprint_payload = {
         "version": APP_VERSION,
         "cohort": len(cache),
-        "reference": reference_name,
-        "weights": [
-            round(float(x), 6)
-            for x in weights
-        ],
+        "pool_k": SELECTOR_POOL_K,
+        "selector_spec": best_oof["spec"],
         "model8_hash": MODEL8_HASH,
         "neural_hash": NEURAL_HASH,
+        "feature_columns": selector["feature_columns"],
     }
 
     fingerprint = hashlib.sha256(
@@ -1648,13 +2527,11 @@ def run_calibration() -> dict:
         "m8_win": m8_win,
         "m8_place": m8_place,
         "neural": neural,
-        "reference_column": reference_column,
-        "reference_name": reference_name,
-        "reference_metrics": reference_metrics,
-        "weights": weights,
-        "optimized": optimized,
-        "leaderboard": leaderboard,
-        "lock_ok": lock_ok,
+        "market": market,
+        "v4_metrics": v4_metrics,
+        "oracle": oracle,
+        "selector": selector,
+        "lock_ok": True,
         "fingerprint": fingerprint,
     }
 
@@ -1778,33 +2655,27 @@ def future_data(
 # =============================================================================
 
 with st.sidebar:
-    st.header("⚙️ Multi M9 V4")
+    st.header("⚙️ Multi M9 V5 Selector")
     st.write(f"**Version :** `{APP_VERSION}`")
     st.write("**Model #8 :** gelé")
     st.write("**Neural #9 :** gelé")
-    st.write(
-        f"**Calibration :** "
-        f"{CALIBRATION_START.strftime('%d/%m/%Y')} → "
-        f"{CALIBRATION_END.strftime('%d/%m/%Y')}"
-    )
-    st.write("**Cohorte attendue :** 84")
+    st.write("**Pool :** Top6 M8 place + Neural + marché")
+    st.write("**Sortie :** exactement 4 chevaux")
+    st.write("**Cohorte calibration :** 84 courses")
 
-    if "m9v4" in st.session_state:
-        cal = st.session_state["m9v4"]
-
-        if cal["lock_ok"]:
-            st.success(
-                "✅ Calibration cohérente et verrouillable"
-            )
-        else:
-            st.error(
-                "⚠️ Calibration non verrouillable"
-            )
+    if "m9v5" in st.session_state:
+        cal = st.session_state["m9v5"]
+        st.success("✅ V5 calibré dans cette session")
+        st.caption(
+            "Empreinte : "
+            + cal["fingerprint"][:14]
+            + "…"
+        )
 
 
 tab_cal, tab_live, tab_method = st.tabs(
     [
-        "🧪 Calibration exacte 84 — V4",
+        "🧠 Calibration V5 Selector",
         "🎯 Pronostics Multi",
         "📐 Méthode",
     ]
@@ -1812,189 +2683,165 @@ tab_cal, tab_live, tab_method = st.tabs(
 
 
 with tab_cal:
-    st.subheader(
-        "🧪 Reconstruction et calibration exacte"
-    )
+    st.subheader("🧠 V5 : apprendre à choisir 4 chevaux dans le pool Top6")
 
-    st.info(
-        "V4 reconstruit la cohorte initiale tout en gérant les ex-aequo. "
-        "Elle relit les rapports définitifs PMU et extrait la combinaison Multi gagnante."
+    st.warning(
+        "Les 84 courses sont des données de calibration/découverte. "
+        "Le score 'Train' peut être surajusté. "
+        "Pour choisir le modèle à utiliser sur les prochaines courses, "
+        "V5 privilégie le score OOF groupé par course."
     )
 
     if st.button(
-        "🚀 Reconstruire les 84 et calibrer M9 V4",
+        "🚀 Calibrer V5 Selector sur les 84 courses",
         type="primary",
         use_container_width=True,
     ):
         try:
-            st.session_state["m9v4"] = (
+            st.session_state["m9v5"] = (
                 run_calibration()
             )
         except Exception as exc:
             st.exception(exc)
 
-    cal = st.session_state.get("m9v4")
+    cal = st.session_state.get("m9v5")
 
     if cal is not None:
-        pmu_all = cal["pmu_all"]
-        pmu_reports_ok = cal["pmu_reports_ok"]
-        historical_complete = cal["historical_complete"]
-        cache = cal["cache"]
+        selector = cal["selector"]
+        robust = selector["best_oof"]
+        historical = selector["best_train"]
 
         c1, c2, c3, c4 = st.columns(4)
 
         c1.metric(
-            "Candidats exacts E_MULTI / E_MINI_MULTI",
-            len(pmu_all),
+            "Cohorte",
+            len(cal["cache"]),
+            delta="OK = 84",
         )
 
         c2.metric(
-            "Rapports Multi Top4 exploitables",
-            len(pmu_reports_ok),
+            "M8 place Multi4",
+            f"{cal['m8_place']['hits4']}/84",
         )
 
         c3.metric(
-            "Cohorte historique complète",
-            len(historical_complete),
-            delta=(
-                "OK = 84"
-                if len(historical_complete) == EXPECTED_COHORT
-                else "attendu 84"
-            ),
+            "M9 V4",
+            f"{cal['v4_metrics']['hits4']}/84",
+            delta=f"{cal['v4_metrics']['hits4'] - cal['m8_place']['hits4']:+d} vs M8",
         )
 
         c4.metric(
-            "Multi4 M9 optimisé",
-            f"{cal['optimized']['hits4']}/"
-            f"{cal['optimized']['eligible4']}",
+            "Oracle Top6",
+            f"{robust['oof_metrics']['oracle_pool_hits']}/84",
+            delta="plafond du pool",
         )
 
-        if len(cache) == EXPECTED_COHORT:
-            st.success(
-                "✅ 84/84 courses ont une cible PMU, une arrivée complète "
-                "et les prédictions M8 + Neural appariées."
-            )
-        else:
-            st.error(
-                f"❌ Cohorte finale exploitable : {len(cache)} au lieu de 84."
+        st.success(
+            "✅ Sanity check validé : M8 place = "
+            f"{cal['m8_place']['hits4']}/84, "
+            f"{cal['m8_place']['hits5']}/84, "
+            f"{cal['m8_place']['hits6']}/84."
+        )
+
+        st.markdown("### 🎯 Résultat V5")
+
+        a, b, c, d = st.columns(4)
+
+        a.metric(
+            "V5 robuste — OOF Multi4",
+            f"{robust['oof_metrics']['exact_hits']}/84",
+            delta=f"{robust['oof_metrics']['exact_hits'] - cal['m8_place']['hits4']:+d} vs M8",
+        )
+
+        b.metric(
+            "V5 robuste — ≥3/4",
+            f"{robust['oof_metrics']['three_plus']}/84",
+        )
+
+        c.metric(
+            "Même modèle entraîné sur 84",
+            f"{robust['train_metrics']['exact_hits']}/84",
+            help="Score in-sample : utile pour le calibrage, pas pour une validation indépendante.",
+        )
+
+        d.metric(
+            "Historique max testé",
+            f"{historical['train_metrics']['exact_hits']}/84",
+            help="Meilleur score in-sample parmi les modèles testés. Diagnostic de capacité/overfit.",
+        )
+
+        st.write(
+            f"**Modèle choisi pour le forward :** `{robust['spec']['name']}`"
+        )
+
+        if historical["spec"]["name"] != robust["spec"]["name"]:
+            st.caption(
+                "Le modèle qui maximise purement l'historique est "
+                f"`{historical['spec']['name']}` "
+                f"({historical['train_metrics']['exact_hits']}/84 en train, "
+                f"{historical['oof_metrics']['exact_hits']}/84 en OOF). "
+                "Il n'est pas utilisé par défaut en forward."
             )
 
-        st.divider()
+        st.markdown("### 🔭 Plafond oracle des pools")
 
-        comparison = pd.DataFrame(
-            [
-                {
-                    "Stratégie": "M8 win",
-                    "Multi4": cal["m8_win"]["hits4"],
-                    "Top5 contient les 4": cal["m8_win"]["hits5"],
-                    "Top6 contient les 4": cal["m8_win"]["hits6"],
-                    "Top7 contient les 4": cal["m8_win"]["hits7"],
-                },
-                {
-                    "Stratégie": "M8 place",
-                    "Multi4": cal["m8_place"]["hits4"],
-                    "Top5 contient les 4": cal["m8_place"]["hits5"],
-                    "Top6 contient les 4": cal["m8_place"]["hits6"],
-                    "Top7 contient les 4": cal["m8_place"]["hits7"],
-                },
-                {
-                    "Stratégie": "Neural #9",
-                    "Multi4": cal["neural"]["hits4"],
-                    "Top5 contient les 4": cal["neural"]["hits5"],
-                    "Top6 contient les 4": cal["neural"]["hits6"],
-                    "Top7 contient les 4": cal["neural"]["hits7"],
-                },
-                {
-                    "Stratégie": "🏇 Multi M9 V4 optimisé",
-                    "Multi4": cal["optimized"]["hits4"],
-                    "Top5 contient les 4": cal["optimized"]["hits5"],
-                    "Top6 contient les 4": cal["optimized"]["hits6"],
-                    "Top7 contient les 4": cal["optimized"]["hits7"],
-                },
+        st.dataframe(
+            cal["oracle"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### 🏆 Comparaison des modèles Selector")
+
+        st.dataframe(
+            selector["leaderboard"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("🔎 Courses OOF du modèle retenu"):
+            detail = robust["oof_metrics"]["detail"].copy()
+            audit = cal["audit"][
+                cal["audit"]["usable_84"] == True
+            ][
+                [
+                    "race_date",
+                    "meeting_number",
+                    "race_number",
+                    "race_id",
+                    "multi_codes",
+                    "target_top4_pmu",
+                ]
+            ].copy()
+
+            detail = audit.merge(
+                detail,
+                on="race_id",
+                how="left",
+            )
+
+            st.dataframe(
+                detail,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with st.expander("🔎 Dataset candidats V5"):
+            show_cols = [
+                "race_id_selector",
+                "horse_number",
+                "horse_name",
+                "m8_rank_place",
+                "neural_rank",
+                "market_rank",
+                "votes_top4",
+                "votes_top6",
+                "pool_size",
+                "is_target",
             ]
-        )
 
-        st.dataframe(
-            comparison,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        if cal["reference_column"] is not None:
-            st.success(
-                "✅ Référence historique reproduite : "
-                f"{cal['reference_name']} = "
-                f"{EXPECTED_M8[4]}/84 en Top4, "
-                f"{EXPECTED_M8[5]}/84 en Top5, "
-                f"{EXPECTED_M8[6]}/84 en Top6."
-            )
-        else:
-            st.error(
-                "❌ La référence M8 5/84 — 15/84 — 23/84 "
-                "n'est toujours pas reproduite. "
-                "Ne fige pas les poids : l'audit doit continuer."
-            )
-
-        if cal["lock_ok"]:
-            gain = (
-                cal["optimized"]["hits4"]
-                - EXPECTED_M8[4]
-            )
-
-            st.success(
-                f"🔒 Calibration cohérente : M9 V4 gagne {gain:+d} "
-                "Multi4 sur la cohorte de calibration par rapport au 5/84 de référence."
-            )
-        else:
-            st.warning(
-                "La configuration reste DIAGNOSTIQUE : "
-                "pas de gel tant que cohorte=84 et référence M8 ne sont pas toutes deux validées."
-            )
-
-        st.markdown("#### Poids optimaux")
-
-        st.dataframe(
-            pd.DataFrame(
-                {
-                    "Signal": SIGNAL_NAMES,
-                    "Poids": cal["weights"],
-                    "Poids %": [
-                        f"{100*x:.0f}%"
-                        for x in cal["weights"]
-                    ],
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        with st.expander(
-            "🏆 Top 30 configurations"
-        ):
             st.dataframe(
-                cal["leaderboard"],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        with st.expander(
-            "🔎 Audit course par course"
-        ):
-            st.dataframe(
-                cal["audit"],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        with st.expander(
-            "🔎 Candidats PMU + état des rapports"
-        ):
-            display = pmu_all.drop(
-                columns=["target_set"],
-                errors="ignore",
-            )
-            st.dataframe(
-                display,
+                selector["dataset"][show_cols],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -2002,50 +2849,47 @@ with tab_cal:
         config = {
             "app": APP_NAME,
             "version": APP_VERSION,
-            "lock_ok": bool(cal["lock_ok"]),
-            "cohort_size": len(cache),
-            "reference": cal["reference_name"],
-            "weights": {
-                signal: float(weight)
-                for signal, weight
-                in zip(
-                    SIGNAL_NAMES,
-                    cal["weights"],
-                )
+            "cohort_size": len(cal["cache"]),
+            "pool_k": SELECTOR_POOL_K,
+            "selector_for_forward": robust["spec"],
+            "oof_metrics": {
+                key: value
+                for key, value in robust["oof_metrics"].items()
+                if key != "detail"
             },
-            "optimized": cal["optimized"],
+            "train_metrics": {
+                key: value
+                for key, value in robust["train_metrics"].items()
+                if key != "detail"
+            },
+            "historical_max_spec": historical["spec"],
+            "historical_max_train_multi4": historical["train_metrics"]["exact_hits"],
             "model8_hash": MODEL8_HASH,
             "neural_hash": NEURAL_HASH,
             "fingerprint": cal["fingerprint"],
         }
 
         st.download_button(
-            "⬇️ Télécharger la configuration M9 V4",
+            "⬇️ Télécharger la configuration V5 Selector",
             data=json.dumps(
                 config,
                 ensure_ascii=False,
                 indent=2,
             ),
-            file_name="horseprono_multi_m9_v3_config.json",
+            file_name="horseprono_multi_m9_v5_selector_config.json",
             mime="application/json",
-            disabled=not cal["lock_ok"],
             use_container_width=True,
         )
 
 
 with tab_live:
-    st.subheader("🎯 Pronostics Multi")
+    st.subheader("🎯 Pronostics Multi — V5 Selector")
 
-    cal = st.session_state.get("m9v4")
+    cal = st.session_state.get("m9v5")
 
     if cal is None:
         st.info(
-            "Lance d'abord la calibration V2."
-        )
-    elif not cal["lock_ok"]:
-        st.warning(
-            "Pronostics futurs désactivés tant que la cohorte historique "
-            "et la référence M8 ne sont pas reproduites."
+            "Lance d'abord la calibration V5 dans le premier onglet."
         )
     else:
         selected_day = st.date_input(
@@ -2054,7 +2898,7 @@ with tab_live:
         )
 
         if st.button(
-            "🔎 Analyser les Multi de cette date",
+            "🔎 Analyser les Multi de cette date avec V5",
             type="primary",
             use_container_width=True,
         ):
@@ -2068,10 +2912,13 @@ with tab_live:
                         "Aucune course E_MULTI / E_MINI_MULTI détectée."
                     )
                 else:
+                    robust = cal["selector"]["best_oof"]
+                    model = robust["model"]
+                    feature_columns = cal["selector"]["feature_columns"]
+
                     for _, row in live["mapped"].iterrows():
                         reunion = int(row["meeting_number"])
                         course = int(row["race_number"])
-
                         hippodrome = (
                             row.get("hippodrome")
                             or row.get("hippodrome_pmu")
@@ -2102,9 +2949,28 @@ with tab_live:
                             )
                             continue
 
-                        ranked = rank_m9(
-                            raw,
-                            cal["weights"],
+                        item = {
+                            "race_id": race_id,
+                            "frame": raw,
+                            "field_size": (
+                                _safe_int(row.get("field_size"))
+                                or len(raw)
+                            ),
+                            "discipline": (
+                                row.get("discipline")
+                                or (
+                                    str(raw["discipline"].iloc[0])
+                                    if "discipline" in raw.columns and len(raw)
+                                    else "INCONNU"
+                                )
+                            ),
+                            "multi_codes": row.get("multi_codes"),
+                        }
+
+                        ranked = selector_live_rank(
+                            item,
+                            model,
+                            feature_columns,
                         )
 
                         top4 = (
@@ -2113,109 +2979,92 @@ with tab_live:
                             .tolist()
                         )
 
-                        top5 = (
-                            ranked.head(min(5, len(ranked)))["horse_number"]
-                            .astype(int)
-                            .tolist()
-                        )
-
-                        top6 = (
-                            ranked.head(min(6, len(ranked)))["horse_number"]
-                            .astype(int)
-                            .tolist()
-                        )
-
-                        top7 = (
-                            ranked.head(min(7, len(ranked)))["horse_number"]
-                            .astype(int)
-                            .tolist()
-                        )
-
-                        a, b, c, d = st.columns(4)
-
-                        a.metric(
-                            "🎯 Multi 4 M9",
+                        st.metric(
+                            "🎯 Multi4 V5 Selector",
                             " - ".join(map(str, top4)),
                         )
 
-                        b.metric(
-                            "Top 5",
-                            " - ".join(map(str, top5)),
+                        st.caption(
+                            f"Pool Top6 union : {len(ranked)} chevaux · "
+                            f"modèle forward : {robust['spec']['name']}"
                         )
 
-                        c.metric(
-                            "Top 6",
-                            " - ".join(map(str, top6)),
-                        )
-
-                        d.metric(
-                            "Top 7",
-                            " - ".join(map(str, top7)),
-                        )
-
-                        show = ranked.head(
-                            min(10, len(ranked))
-                        ).copy()
-
-                        show = show[
+                        display = ranked[
                             [
-                                "m9_rank",
+                                "selector_rank",
                                 "horse_number",
                                 "horse_name",
-                                "m9_score",
-                                "m8_rank_win",
+                                "selector_probability",
                                 "m8_rank_place",
                                 "neural_rank",
                                 "market_rank",
+                                "votes_top4",
+                                "votes_top6",
                                 "odds",
                             ]
-                        ]
+                        ].copy()
 
-                        show["m9_score"] = (
-                            show["m9_score"].round(4)
+                        display["selector_probability"] = (
+                            display["selector_probability"]
+                            .round(4)
+                        )
+
+                        display = display.rename(
+                            columns={
+                                "selector_rank": "Rang V5",
+                                "horse_number": "N°",
+                                "horse_name": "Cheval",
+                                "selector_probability": "Score V5",
+                                "m8_rank_place": "M8 placé",
+                                "neural_rank": "Neural",
+                                "market_rank": "Marché",
+                                "votes_top4": "Votes Top4",
+                                "votes_top6": "Votes Top6",
+                                "odds": "Cote",
+                            }
                         )
 
                         st.dataframe(
-                            show,
+                            display,
                             use_container_width=True,
                             hide_index=True,
                         )
+
+                        st.divider()
 
             except Exception as exc:
                 st.exception(exc)
 
 
 with tab_method:
-    st.subheader("📐 Pourquoi cette V4 ?")
+    st.subheader("📐 Logique de V5 Selector")
 
     st.markdown(
         """
-Les exports V1 et V2 ont permis de reconstruire précisément la cohorte initiale :
+V5 ne fait plus une moyenne linéaire de M8, Neural et marché.
 
-- **111** courses portent réellement `E_MULTI` ou `E_MINI_MULTI`;
-- **109** ont un rapport définitif Multi dont le Top4 est exploitable;
-- parmi elles, **84** ont aussi les quatre positions d'arrivée complètes dans
-  Supabase **et** les prédictions gelées M8 + Neural disponibles.
+Pour chaque course :
 
-Cette intersection est exactement le bloc historique utilisé dans notre première
-analyse. V4 gère aussi les **ex-aequo d'arrivée**, ce qui réintègre la course
-R4C4 du 12/09 (deux chevaux classés 1ers). Sur ces 84 courses, le classement
-**M8 place** doit reproduire :
+1. il construit le **pool union des Top6** M8 placé + Neural + marché ;
+2. ce pool contient en moyenne environ **7 chevaux** ;
+3. chaque candidat reçoit des variables de consensus et de divergence :
+   rangs, probabilités, cotes, écarts de rang, votes Top3/4/5/6,
+   appartenance exclusive à un modèle, discipline et taille du peloton ;
+4. plusieurs sélecteurs supervisés sont testés ;
+5. chaque sélecteur doit sortir **exactement 4 chevaux**.
 
-- **5/84** avec 4 chevaux;
-- **15/84** avec 5 chevaux;
-- **23/84** avec 6 chevaux.
+Le choix du modèle forward est fait sur une **validation OOF groupée par course** :
+une course n'est jamais utilisée pour entraîner le modèle qui la prédit dans
+son score OOF.
 
-V4 exige aussi que le Top4 du rapport PMU soit identique aux quatre premiers
-chevaux de l'arrivée Supabase après tri, **sans exiger des rangs distincts 1-2-3-4**.
-Cela respecte les dead-heats / ex-aequo.
-
-Une fois les 84 retrouvées, l'optimiseur teste les **10 626** combinaisons de
-poids et cherche en priorité à maximiser le nombre de Multi4 complets.
+Le score 'Train' est également affiché parce que notre objectif de calibration
+est d'étudier combien des 39/84 Multi théoriquement présents dans le pool Top6
+peuvent être récupérés. Mais ce score est volontairement séparé du score OOF
+pour éviter de confondre surapprentissage et capacité de généralisation.
         """
     )
 
-    st.warning(
-        "Le meilleur score sur les 84 reste un score de calibration. "
-        "Après choix des poids, ils doivent être figés avant les nouvelles courses."
+    st.info(
+        "Après sélection du V5, les 84 courses restent figées. "
+        "Les courses suivantes constituent le vrai test forward."
     )

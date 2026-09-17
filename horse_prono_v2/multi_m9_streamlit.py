@@ -41,7 +41,7 @@ from sklearn.preprocessing import StandardScaler
 # =============================================================================
 
 APP_NAME = "HorseProno Multi M9"
-APP_VERSION = "M9-MULTI-V6-COMBORANKER"
+APP_VERSION = "M9-MULTI-V6.1-COMBORANKER-AUDIT"
 
 PMU_BASE_URL = "https://online.turfinfo.api.pmu.fr/rest/client/1"
 REQUEST_TIMEOUT = 25
@@ -101,9 +101,9 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🏇 HorseProno Multi M9 — V6 ComboRanker")
+st.title("🏇 HorseProno Multi M9 — V6.1 ComboRanker Audit")
 st.caption(
-    "V6 ComboRanker : il évalue directement toutes les combinaisons de 4 chevaux dans le pool Top6."
+    "V6.1 Audit : même ComboRanker, avec tie-break OOF strictement indépendant de la cible."
 )
 
 
@@ -2726,19 +2726,19 @@ def combo_metrics(
         "race_id_combo",
         sort=False,
     ):
+        # IMPORTANT :
+        # le tri doit reproduire le forward SANS utiliser la cible réelle.
+        # L'ancienne V6 utilisait overlap_target comme second critère en cas
+        # d'égalité de score, ce qui introduisait une fuite de cible.
+        #
+        # Ici, on conserve l'ordre déterministe de génération des quartets
+        # et on trie UNIQUEMENT sur combo_score avec un tri stable.
         group = group.sort_values(
-            [
-                "combo_score",
-                "overlap_target",
-            ],
-            ascending=[
-                False,
-                False,
-            ],
+            "combo_score",
+            ascending=False,
+            kind="mergesort",
         )
 
-        # ATTENTION : overlap_target ne sert PAS au choix.
-        # Il n'est présent qu'après le tri pour le diagnostic.
         chosen = group.iloc[0]
 
         hits = int(
@@ -3422,7 +3422,7 @@ def future_data(
 # =============================================================================
 
 with st.sidebar:
-    st.header("⚙️ Multi M9 V6 ComboRanker")
+    st.header("⚙️ Multi M9 V6.1 Audit")
     st.write(f"**Version :** `{APP_VERSION}`")
     st.write("**Cohorte :** 84 courses")
     st.write("**Pool :** union Top6 M8 place + Neural + marché")
@@ -3458,8 +3458,15 @@ with tab_cal:
         "Le score Train reste descriptif : il ne constitue pas une validation indépendante."
     )
 
+    st.error(
+        "Audit méthodologique : V6 utilisait involontairement l'overlap réel comme "
+        "second critère lorsqu'au moins deux quartets avaient exactement le même score. "
+        "V6.1 supprime ce tie-break. Le score V6 précédent (9/84) ne doit donc pas "
+        "être figé tant que ce recalcul n'est pas terminé."
+    )
+
     if st.button(
-        "🚀 Calibrer V6 ComboRanker sur les 84 courses",
+        "🧪 Recalculer V6.1 sans fuite de tie-break",
         type="primary",
         use_container_width=True,
     ):
@@ -3751,7 +3758,7 @@ V6 travaille directement au niveau du **quartet** :
    présents dans ce quartet ;
 5. on sélectionne le quartet au score maximal.
 
-L'entraînement et l'évaluation OOF sont séparés par **course entière**.
+L'entraînement et l'évaluation OOF sont séparés par **course entière**. V6.1 garantit aussi qu'aucune information de l'arrivée n'intervient dans le départage de deux quartets ayant le même score.
 Ainsi aucune combinaison d'une course de validation n'apparaît dans
 l'entraînement du fold qui la prédit.
 

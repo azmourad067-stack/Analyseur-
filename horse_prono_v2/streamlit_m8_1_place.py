@@ -187,7 +187,6 @@ if st.button(
         client, model = load_model()
         snapshots = load_snapshots(date_iso)
         result = predict_r1_course(
-            client=client,
             model=model,
             snapshots=snapshots,
             target_date=selected_date,

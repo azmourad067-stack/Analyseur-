@@ -19,26 +19,15 @@ from app_core.db import get_history_as_of, get_supabase_client
 from app_core.features import entity_snapshot_from_history
 from app_core.pmu import get_programme, programme_choices
 
-try:
-    from scripts.m8_2_top3_place import (
-        ALL_PLACED_ODDS_MEDIAN,
-        MODEL_VERSION_ID,
-        OUTSIDER_MAX_ODDS_EXCLUSIVE,
-        OUTSIDER_MIN_ODDS,
-        R1_PLACED_ODDS_MEDIAN,
-        _load_frozen_m8,
-        predict_course,
-    )
-except Exception:
-    from m8_2_top3_place import (
-        ALL_PLACED_ODDS_MEDIAN,
-        MODEL_VERSION_ID,
-        OUTSIDER_MAX_ODDS_EXCLUSIVE,
-        OUTSIDER_MIN_ODDS,
-        R1_PLACED_ODDS_MEDIAN,
-        _load_frozen_m8,
-        predict_course,
-    )
+from scripts.m8_2_top3_place import (
+    ALL_PLACED_ODDS_MEDIAN,
+    MODEL_VERSION_ID,
+    OUTSIDER_MAX_ODDS_EXCLUSIVE,
+    OUTSIDER_MIN_ODDS,
+    R1_PLACED_ODDS_MEDIAN,
+    _load_frozen_m8,
+    predict_course,
+)
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 

@@ -26,7 +26,6 @@ for p in (REPO_ROOT, HORSE_PRONO_ROOT, HERE):
 # IMPORTS PROJET
 # =============================================================================
 
-from app_core.db import get_supabase_client
 from app_core.forward_utils import non_runner_numbers
 from app_core.pmu import (
     get_participants,
@@ -39,9 +38,13 @@ from neural.forward_capture import (
     NEURAL_ARTIFACT_HASH,
     NEURAL_MODEL_NAME,
     NEURAL_MODEL_VERSION_ID,
-    load_forward_neural,
 )
-from neural.predict import predict_dataframe
+from neural.predict import (
+    MODEL_PATH,
+    load_neural_v1,
+    predict_dataframe,
+    sha256_file,
+)
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
@@ -222,20 +225,29 @@ def display_table(ranked: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_resource(show_spinner=False)
 def load_neural_model():
-    client = get_supabase_client()
+    """
+    Charge directement le Neural V1 figé depuis les artefacts du dépôt.
 
-    if client is None:
+    Important :
+    - aucune dépendance à la visibilité RLS de model_versions ;
+    - le SHA256 du fichier .pt est vérifié avant chargement ;
+    - le modèle n'est jamais réentraîné ici.
+    """
+    if not MODEL_PATH.exists():
         raise RuntimeError(
-            "Supabase non configuré. Ajoute SUPABASE_URL et SUPABASE_KEY "
-            "(ou SUPABASE_SERVICE_KEY selon ta configuration) dans les Secrets Streamlit."
+            f"Fichier Neural absent : {MODEL_PATH}. "
+            "Vérifie que models/neural/horseprono_neural_v1.pt est bien dans GitHub."
         )
 
-    # Cette fonction contrôle :
-    # - l'ID Supabase #9
-    # - le nom du modèle
-    # - le hash stocké en base
-    # - le hash du .pt présent dans le dépôt
-    return load_forward_neural(client)
+    local_hash = sha256_file(MODEL_PATH)
+
+    if local_hash != NEURAL_ARTIFACT_HASH:
+        raise RuntimeError(
+            "Le fichier Neural présent dans le dépôt n'est pas le modèle figé attendu. "
+            f"Attendu : {NEURAL_ARTIFACT_HASH} | Trouvé : {local_hash}"
+        )
+
+    return load_neural_v1()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -296,7 +308,7 @@ with st.sidebar:
     st.markdown(f"**Modèle :** #{NEURAL_MODEL_VERSION_ID} `{NEURAL_MODEL_NAME}`")
     st.markdown("**Cible ML :** probabilité de finir dans le Top 3")
     st.markdown("**Signal suivi :** rang Neural #5")
-    st.caption(f"Hash attendu : `{NEURAL_ARTIFACT_HASH[:14]}…`")
+    st.caption(f"Hash modèle attendu : `{NEURAL_ARTIFACT_HASH[:14]}…`")
 
     st.info(
         "Le rang #5 est un signal expérimental issu de notre validation historique. "
@@ -634,7 +646,6 @@ test prospectivement sans réentraîner le modèle.
 - Nom attendu : **`{NEURAL_MODEL_NAME}`**
 - SHA256 attendu : **`{NEURAL_ARTIFACT_HASH}`**
 
-`load_forward_neural()` vérifie l'enregistrement Supabase et le hash du fichier
-`models/neural/horseprono_neural_v1.pt` avant de charger le réseau.
+L'app vérifie directement le SHA256 du fichier `models/neural/horseprono_neural_v1.pt` avant de charger le réseau. Elle ne dépend donc plus de la politique RLS de `model_versions`.
                 """
             )

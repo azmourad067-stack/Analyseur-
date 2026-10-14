@@ -1,0 +1,33 @@
+name: HorseProno Morning Forward V1
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Le script doit vérifier 09:00 Europe/Paris et garantir l'idempotence.
+    - cron: "5 7,8 * * *"
+
+concurrency:
+  group: horseprono-morning-forward-v1
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: horse_prono_v2/requirements.txt
+      - name: Installer les dépendances
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r horse_prono_v2/requirements.txt
+      - name: Capture dédiée (après intégration du script)
+        env:
+          SUPABASE_URL: \${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: \${{ secrets.SUPABASE_KEY }}
+          HORSEPRONO_EXPERIMENT_NAME: horseprono_morning_forward_v1
+        run: python horse_prono_v2/scripts/forward_morning_v1.py

@@ -1,0 +1,57 @@
+name: Quinte Payouts (rapports définitifs PMU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Date de début (YYYY-MM-DD, optionnel)"
+        required: false
+        default: ""
+      until:
+        description: "Date de fin (YYYY-MM-DD, optionnel)"
+        required: false
+        default: ""
+      force:
+        description: "Re-télécharger même si déjà en base"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests supabase
+
+      - name: Fetch Quinte+ payouts
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.since }}" ]; then ARGS="$ARGS --since ${{ inputs.since }}"; fi
+          if [ -n "${{ inputs.until }}" ]; then ARGS="$ARGS --until ${{ inputs.until }}"; fi
+          if [ "${{ inputs.force }}" = "true" ]; then ARGS="$ARGS --force"; fi
+          python -u horse_prono_v2/scripts/fetch_quinte_payouts.py $ARGS
+
+      - name: Upload CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quinte-payouts
+          path: horse_prono_v2/artifacts/quinte_payouts/
+          if-no-files-found: warn
+          retention-days: 30

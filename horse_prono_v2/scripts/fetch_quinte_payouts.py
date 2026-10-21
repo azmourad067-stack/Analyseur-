@@ -63,8 +63,10 @@ def _safe_float(value):
 
 
 def classify_category(libelle, type_rapport=None) -> str:
-    """ORDRE / DESORDRE / BONUS_4SUR5 / BONUS_4 / BONUS_3 / OTHER."""
+    """ORDRE / ORDRE_TIRELIRE / DESORDRE / BONUS_4SUR5 / BONUS_4 / BONUS_3 / TIRELIRE / OTHER."""
     text = _norm(f"{libelle or ''} {type_rapport or ''}")
+    if "tirelire" in text:          # « Ordre + e-Tirelire » est un rapport distinct de « Ordre »
+        return "ORDRE_TIRELIRE" if re.search(r"\bordre\b", text) else "TIRELIRE"
     if "desordre" in text:          # à tester AVANT "ordre" (désordre contient « ordre »)
         return "DESORDRE"
     if "bonus" in text:
@@ -157,6 +159,7 @@ def per_euro_dividend(block: dict, report: dict):
 
 def parse_payload(payload) -> list[dict]:
     rows: list[dict] = []
+    seen: dict[tuple, int] = {}
     for block in iter_bet_blocks(payload):
         bet_type = str(block.get("typePari") or "").strip().upper()
         if "QUINTE" not in bet_type:
@@ -174,17 +177,22 @@ def parse_payload(payload) -> list[dict]:
             per_euro, warning = per_euro_dividend(block, report)
             div_base_c = _safe_float(report.get("dividendePourUneMiseDeBase"))
             winners = report.get("nombreGagnants")
+            key = "-".join(map(str, combo))
+            count = seen.get((bet_type, category, key), 0)
+            seen[(bet_type, category, key)] = count + 1
+            if count:                       # même clé déjà vue dans cette course : on garde la ligne
+                key = f"{key}#{count + 1}"
             rows.append(
                 {
                     "bet_type": bet_type,
                     "category": category,
                     "libelle": str(libelle) or None,
                     "combination": combo or None,
-                    "combination_key": "-".join(map(str, combo)),
+                    "combination_key": key,
                     "dividend_per_euro": round(per_euro, 2) if per_euro is not None else None,
                     "dividend_per_base": round(div_base_c / 100.0, 2) if div_base_c is not None else None,
                     "base_stake": round(base_stake_c / 100.0, 2) if base_stake_c is not None else None,
-                    "winners": int(winners) if isinstance(winners, (int, float)) else None,
+                    "winners": round(float(winners), 2) if isinstance(winners, (int, float)) and not isinstance(winners, bool) else None,
                     "parse_warning": warning,
                 }
             )
@@ -287,11 +295,12 @@ def main() -> int:
     supports = load_all(client, "quinte_supports", "race_date,meeting_number,race_number", since=args.since, until=args.until)
     done = set()
     if not args.force:
-        for r in load_all(client, "quinte_payouts_raw", "race_date,meeting_number,race_number", since=args.since, until=args.until):
+        for r in load_all(client, "quinte_payouts", "race_date,meeting_number,race_number", since=args.since, until=args.until):
             done.add((r["race_date"], r["meeting_number"], r["race_number"]))
 
     todo = [s for s in supports if (s["race_date"], s["meeting_number"], s["race_number"]) not in done]
-    print(f"Quinté+ : {len(supports)} | déjà en base : {len(done)} | à récupérer : {len(todo)}", flush=True)
+    print(f"Filtres : since={args.since or '-'} until={args.until or '-'} force={args.force}", flush=True)
+    print(f"Quinté+ : {len(supports)} | déjà en base (rapports parsés) : {len(done)} | à récupérer : {len(todo)}", flush=True)
 
     all_rows, failures, empty = [], 0, 0
     for i, s in enumerate(todo, 1):

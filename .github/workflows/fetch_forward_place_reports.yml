@@ -1,0 +1,44 @@
+name: Collecter rapports PMU Simple Place
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Date de début (YYYY-MM-DD)"
+        required: true
+        default: "2026-09-09"
+      end_date:
+        description: "Date de fin (YYYY-MM-DD)"
+        required: true
+        default: "2026-10-23"
+      force:
+        description: "Retélécharger les rapports déjà présents"
+        type: boolean
+        required: true
+        default: false
+
+jobs:
+  collect-reports:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: horse_prono_v2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Collecter rapports PMU
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.force }}" = "true" ]; then ARGS="--force"; fi
+          python scripts/fetch_forward_place_reports.py \
+            --start "${{ inputs.start_date }}" \
+            --end "${{ inputs.end_date }}" $ARGS
